@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     VLLM_BASE_URL: str
     VLLM_API_KEY: str
     # The model name must match the one vLLM is serving
-    VLLM_MODEL_NAME: str = "RedHatAI/gemma-3-4b-it-FP8-dynamic"
+    VLLM_MODEL_NAME: str
 
     # --- Triton (Jina Embedder) Connection ---
     TRITON_URL: str

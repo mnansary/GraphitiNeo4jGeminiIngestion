@@ -2,7 +2,7 @@
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import List, Dict, Any, Optional, Union
 
 import aiohttp
 import numpy as np
@@ -41,7 +41,7 @@ class JinaV3TritonEmbedderConfig(EmbedderConfig):
         description="The name of the output tensor from the Triton model."
     )
     batch_size: int = Field(
-        default=32,
+        default=8,
         description="Number of texts to process in a single batch request to Triton."
     )
     request_timeout: int = Field(
@@ -157,20 +157,31 @@ class JinaV3TritonEmbedder(EmbedderClient):
             logger.error(f"Failed to get embeddings from Triton at {api_url}. Error: {e}")
             raise
 
-    async def create(self, input_data: str) -> List[float]:
+    async def create(self, input_data: Union[str, List[str]]) -> List[float]:
         """
         Creates an embedding for a single input string (typically a query).
+        This method handles either a single string or a list containing one string,
+        to be compatible with how Graphiti's internal search calls it.
         This method uses the QUERY model.
         """
-        if not isinstance(input_data, str) or not input_data:
-            raise TypeError("create() expects a non-empty string.")
+        text_to_embed = ""
+        if isinstance(input_data, str):
+            text_to_embed = input_data
+        elif isinstance(input_data, list) and len(input_data) > 0:
+            text_to_embed = input_data[0]  # Extract the string from the list
 
-        embeddings = await self._embed_batch([input_data], self.config.query_model_name)
+        if not text_to_embed or not isinstance(text_to_embed, str):
+            raise TypeError(
+                f"create() expects a non-empty string or a list with one string, but got {type(input_data)}"
+            )
+
+        embeddings = await self._embed_batch([text_to_embed], self.config.query_model_name)
 
         if not embeddings:
             raise ValueError("API returned no embedding for the input.")
-        
+
         return embeddings[0]
+    
 
     async def create_batch(self, input_data_list: List[str]) -> List[List[float]]:
         """

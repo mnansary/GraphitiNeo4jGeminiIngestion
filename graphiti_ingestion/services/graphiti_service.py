@@ -6,6 +6,8 @@ from openai import AsyncOpenAI
 
 from graphiti_core import Graphiti
 from graphiti_core.llm_client import LLMConfig, OpenAIClient
+from graphiti_ingestion.core.compatible_openai_client import CompatibleOpenAIClient
+from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.nodes import EpisodeType
 
 # Note: These imports will resolve once we create the corresponding files.
@@ -54,12 +56,16 @@ class GraphitiService:
             uri=self.settings.NEO4J_URI,
             user=self.settings.NEO4J_USER,
             password=self.settings.NEO4J_PASSWORD,
-            llm_client=OpenAIClient(
+            llm_client=CompatibleOpenAIClient(
                 config=vllm_llm_config,
                 client=llm_client_vllm
             ),
             embedder=self.jina_embedder,
-            # cross_encoder can be added here if needed
+            # CHANGE: Explicitly configure the cross_encoder to use your vLLM server.
+            cross_encoder=OpenAIRerankerClient(
+                config=vllm_llm_config,  # Reuse the same config
+                client=llm_client_vllm   # Reuse the same client
+            )
         )
         logger.info("GraphitiService initialized.")
 
@@ -95,10 +101,10 @@ class GraphitiService:
         description = episode_data["description"]
         
         # Map the string type from the API to the Graphiti Enum
-        episode_type_enum = EpisodeType[episode_type_str.upper()]
+        episode_type_enum = EpisodeType[episode_type_str]
 
         # Ensure JSON content is serialized to a string for Graphiti
-        if episode_type_enum == EpisodeType.JSON:
+        if episode_type_enum == EpisodeType.json:
             episode_body = json.dumps(content)
         else:
             episode_body = content
