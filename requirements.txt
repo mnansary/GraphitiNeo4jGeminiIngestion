@@ -1,0 +1,21 @@
+# --- Web Framework & Server ---
+fastapi
+uvicorn[standard]
+
+# --- Graph & Database ---
+graphiti-core
+neo4j
+
+# --- Configuration ---
+pydantic-settings
+python-dotenv
+
+# --- AI/ML Service Clients ---
+openai
+aiohttp
+
+# --- Embedder & Tokenizer Dependencies ---
+transformers
+numpy~=1.26.4
+torch
+sentencepiece
