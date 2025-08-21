@@ -295,8 +295,8 @@ sudo systemctl restart graphiti-ingestion.service
 - **Problem:** Changes to `.env` file are not reflected.
   - **Solution:** You must restart the service for it to reload the environment file: `sudo systemctl restart graphiti-ingestion.service`.
 
-
-  # Set up Neo4j with Docker
+---
+# Set up Neo4j with Docker
 
 **Action Required:** Throughout this guide, replace the placeholder `YOUR_SERVER_IP` with your machine’s actual Local Area Network (LAN) IP address (e.g., `192.168.1.101`).
 
