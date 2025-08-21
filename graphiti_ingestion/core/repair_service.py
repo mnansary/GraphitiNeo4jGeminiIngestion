@@ -13,6 +13,7 @@ from graphiti_core.prompts.invalidate_edges import InvalidatedEdges
 from graphiti_core.prompts.models import Message
 from graphiti_core.prompts.summarize_nodes import Summary
 from pydantic import BaseModel, ValidationError
+#from graphiti_ingestion.core.compatible_openai_client import CompatibleOpenAIClient
 
 # Use Python's standard logging module
 logger = logging.getLogger(__name__)
@@ -108,52 +109,51 @@ REPAIR_DISPATCHER: Dict[type[BaseModel], Callable[[Dict], Dict]] = {
 # --- Step 3: The Self-Healing and Orchestration Logic ---
 
 async def _attempt_llm_self_healing(
-    llm_client: OpenAIClient,
+    llm_client: "CompatibleOpenAIClient", # Add type hint for clarity
     original_messages: list[Message],
     failed_json: str,
     validation_error: str,
     response_model: type[BaseModel],
 ) -> Dict[str, Any]:
+    # ... (the healing_prompt construction is the same) ...
     model_name = response_model.__name__
     schema_json = json.dumps(response_model.model_json_schema(), indent=2)
 
     healing_prompt = f"""
-Your previous attempt to generate a JSON object failed. You must correct your mistake.
-
-Here was the original final instruction:
----
-{original_messages[-1].content}
----
-
-Here is the invalid JSON you produced:
----
-{failed_json}
----
-
-Here is the Pydantic validation error that occurred:
----
-{validation_error}
----
-
-TASK:
-Carefully analyze the validation error and the original instruction.
-Correct the JSON object to make it perfectly valid according to the schema.
-Your response MUST be ONLY the corrected JSON object, with no other text, explanations, or markdown formatting.
-The required schema is:
----
-{schema_json}
----
-"""
+    Your previous attempt to generate a JSON object failed. You must correct your mistake.
+    Here was the original final instruction:
+    ---
+    {original_messages[-1].content}
+    ---
+    Here is the invalid JSON you produced:
+    ---
+    {failed_json}
+    ---
+    Here is the Pydantic validation error that occurred:
+    ---
+    {validation_error}
+    ---
+    TASK:
+    Carefully analyze the validation error and the original instruction.
+    Correct the JSON object to make it perfectly valid according to the schema.
+    Your response MUST be ONLY the corrected JSON object, with no other text, explanations, or markdown formatting.
+    The required schema is:
+    ---
+    {schema_json}
+    ---
+    """
     healing_messages = [
         Message(role="system", content="You are an expert at correcting malformed JSON data to match a given Pydantic schema."),
         Message(role="user", content=healing_prompt),
     ]
 
     logger.warning("Attempting LLM self-healing call...")
-    healed_dict = await llm_client.generate_response(
-        healing_messages,
-        response_model=None,
-    )
+    
+    # --- THIS IS THE CRITICAL CHANGE ---
+    # We now call the new _direct_llm_call method to prevent a recursive loop.
+    healed_dict = await llm_client._direct_llm_call(healing_messages)
+    # --- END OF CHANGE ---
+
     return healed_dict
 
 async def repair_and_validate(
