@@ -1,0 +1,40 @@
+# /home/vpa/KnowledgeGraphNeo4j/graphiti-ingestion.service
+
+[Unit]
+Description=Graphiti Ingestion Service
+# This service will start after the network is available.
+After=network.target
+
+[Service]
+# --- User and Working Directory ---
+# The user that will run the service, based on your home directory.
+User=vpa
+# The absolute path to the root directory of your project.
+WorkingDirectory=/home/vpa/KnowledgeGraphNeo4j
+
+# --- Execution Command ---
+# This command uses the specific Python from your 'base' conda environment
+# to run the uvicorn module, starting your FastAPI app on port 6000.
+ExecStart=/home/vpa/miniconda3/bin/python -m uvicorn main:app --host 0.0.0.0 --port 6000
+
+# --- Environment Configuration ---
+# This line tells systemd to load all variables from your .env file.
+EnvironmentFile=/home/vpa/KnowledgeGraphNeo4j/.env
+
+# --- Process Management ---
+# Restart the service automatically if it crashes.
+Restart=always
+# Wait 10 seconds before attempting to restart.
+RestartSec=10
+# Set a timeout for stopping the service.
+TimeoutStopSec=30
+
+# --- Logging ---
+# Redirect standard output and error to the system's journal.
+# This allows you to view logs with `journalctl`.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# This line enables the service to be started at boot time.
+WantedBy=multi-user.target

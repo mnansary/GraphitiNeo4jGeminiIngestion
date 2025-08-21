@@ -1,0 +1,1957 @@
+================================================================================
+--- File: main.py ---
+================================================================================
+
+import asyncio
+import logging
+import time
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from graphiti_ingestion.api.episodes import router as episodes_router
+from graphiti_ingestion.config import get_settings
+from graphiti_ingestion.services.graphiti_service import (
+    GraphitiService,
+    get_graphiti_service,
+    initialize_graphiti_service,
+)
+from graphiti_ingestion.services.task_queue import TaskQueue, get_task_queue
+
+# --- Basic Logging Configuration ---
+settings = get_settings()
+logging.basicConfig(
+    level=settings.LOG_LEVEL.upper(),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+
+# --- Background Worker Task ---
+async def worker(task_queue: TaskQueue, graphiti_service: GraphitiService):
+    """
+    The main background worker function.
+    """
+    logger.info("Background worker started.")
+    while True:
+        try:
+            job = await task_queue.get_job()
+            job_id = job["job_id"]
+            data = job["data"]
+
+            logger.info(f"Worker processing job {job_id}...")
+            await task_queue.update_job_status(job_id, "processing")
+
+            try:
+                await graphiti_service.process_and_add_episode(data)
+                await task_queue.update_job_status(
+                    job_id, "completed", "Episode successfully ingested."
+                )
+                logger.info(f"Worker successfully completed job {job_id}.")
+            except Exception as e:
+                error_message = f"Failed to process episode: {e}"
+                logger.error(f"Worker failed on job {job_id}: {error_message}", exc_info=True)
+                await task_queue.update_job_status(job_id, "failed", error_message)
+            finally:
+                task_queue.mark_task_done()
+
+        except asyncio.CancelledError:
+            logger.info("Background worker received cancellation request. Shutting down.")
+            break
+        except Exception as e:
+            logger.critical(f"An unexpected error occurred in the worker loop: {e}", exc_info=True)
+            await asyncio.sleep(5)
+
+
+# --- Application Lifespan Management ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Manages the application's startup and shutdown events.
+    """
+    logger.info("Application starting up...")
+    
+    graphiti_service = initialize_graphiti_service()
+    task_queue = get_task_queue()
+
+    await graphiti_service.startup()
+
+    worker_task = asyncio.create_task(worker(task_queue, graphiti_service))
+    
+    yield
+    
+    logger.info("Application shutting down...")
+    
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        logger.info("Background worker task successfully cancelled.")
+
+    await graphiti_service.shutdown()
+    logger.info("Application shutdown complete.")
+
+
+# --- FastAPI App Initialization ---
+app = FastAPI(
+    title="Graphiti Ingestion Service",
+    description="An asynchronous service to ingest data into a Neo4j knowledge graph using Graphiti.",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+# --- MIDDLEWARE & EXCEPTION HANDLERS ---
+# The order of middleware matters. The first one added is the first to process the request.
+
+# 1. Global Exception Handler
+# This will catch any unhandled exception and return a clean JSON response.
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception for request {request.method} {request.url}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An internal server error occurred."},
+    )
+
+# 2. CORS Middleware
+# Allows web frontends to communicate with this API.
+# For production, you should restrict origins to your specific frontend domain.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+# 3. Request Logging and Process Time Middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = time.time()
+    
+    response = await call_next(request)
+    
+    process_time = (time.time() - start_time) * 1000
+    response.headers["X-Process-Time"] = f"{process_time:.2f} ms"
+    
+    logger.info(
+        f'Request: {request.method} {request.url.path} - Response: {response.status_code} - Time: {process_time:.2f}ms'
+    )
+    return response
+
+
+# --- API ROUTERS ---
+# Include the API router after middleware is defined.
+app.include_router(episodes_router)
+
+
+@app.get("/", tags=["Health Check"])
+async def read_root():
+    """
+    Root endpoint for basic health check.
+    """
+    return {"status": "ok", "message": "Graphiti Ingestion Service is running."}
+
+================================================================================
+--- File: README.md ---
+================================================================================
+
+# KnowledgeGraphNeo4j
+# Set up Neo4j with Docker
+
+**Action Required:** Throughout this guide, replace the placeholder `YOUR_SERVER_IP` with your machine’s actual Local Area Network (LAN) IP address (e.g., `192.168.1.101`).
+
+---
+
+### Step 1: Find Your Server's LAN IP Address (Prerequisite)
+
+First, identify the local IP address of the server that will host the Docker container. This IP will be used in the TLS certificate and the Docker port bindings.
+
+```bash
+# On Linux
+hostname -I | awk '{print $1}'
+# Or
+ip addr show
+
+# On macOS
+ifconfig | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}'
+```
+**Why this is important:** This IP is the address other machines on your network will use to connect to the database. It must be correct for the security settings to work.
+
+#### For localhost actually these are not needed
+
+
+---
+
+### Step 2: Create Project Structure and Set Permissions
+
+This step organizes all your configuration and data files and ensures the Neo4j process inside the container can access them without permission errors.
+
+```bash
+# Create the complete directory structure
+mkdir -p neo4j-local-secure/{conf,data,logs,plugins,certificates,secrets}
+cd neo4j-local-secure
+
+# Set ownership to match the container's internal neo4j user (UID 101, GID 101)
+sudo chown -R 101:101 data logs conf plugins certificates
+```
+**Why this is important:** This prevents "Permission Denied" errors when the non-root `neo4j` user in the container tries to write to the data or log directories.
+
+---
+
+### Step 3: Secure the Admin Password via Docker Secrets
+
+We will generate a strong password and store it in a file. Docker Secrets will manage this file, keeping the password out of your configuration and environment variables.
+
+```bash
+# 1. Generate a strong, random password for the 'neo4j' user
+openssl rand -base64 32 > secrets/neo4j_password
+
+# 2. Create the final secret file in the format Neo4j expects: username/<password>
+echo "neo4j/$(cat secrets/neo4j_password)" > secrets/neo4j_auth
+
+# 3. (Optional) Display the password once to save it in your password manager
+echo "Your secure password is: $(cat secrets/neo4j_password)"
+```
+**Why this is important:** This is a secure method for handling credentials, vastly superior to hardcoding them or using plain environment variables.
+
+---
+#### Alternative
+**IMPORTANT**: If you want to do it with root:The problem is a combination of file permissions in the root (`/`) directory and a common issue with how `sudo` works with output redirection (`>`).
+
+Here is the explanation and the corrected set of commands for only this step.
+
+### The Problem
+
+1.  **Directory Ownership:** When you ran `sudo mkdir -p ...`, the `secrets` directory was created and is owned by the `root` user.
+2.  **Redirection (`>`) Failure:** The command `sudo openssl ... > ...` fails because the shell (bash) tries to set up the file redirection *before* it runs the `sudo` command. Your regular user (`your non root user`) does not have permission to write to the `root`-owned `secrets` directory, so the operation fails before `openssl` even runs.
+
+### The Solution
+
+We need to pipe (`|`) the output of `openssl` to a command that can be run with `sudo` and can write to a file. The `tee` command is perfect for this.
+
+Here are the corrected commands to create your password secrets in `/neo4j-local-secure/secrets`.
+
+```bash
+# Ensure you are in the correct directory
+cd /neo4j-local-secure
+
+# --- CORRECTED COMMANDS START HERE ---
+
+# 1. Generate the password and pipe it to `tee`, which uses sudo to write the file.
+openssl rand -base64 32 | sudo tee secrets/neo4j_password > /dev/null
+
+# 2. Create the final auth secret file using the same technique.
+echo "neo4j/$(sudo cat secrets/neo4j_password)" | sudo tee secrets/neo4j_auth > /dev/null
+
+# 3. (Optional) Verify the files were created and are owned by root.
+sudo ls -l secrets
+
+# 4. (Optional) Display the password so you can save it.
+echo "Your secure password is: $(sudo cat secrets/neo4j_password)"
+```
+
+#### Command Explanation
+
+*   **`openssl rand -base64 32`**: This part is the same; it generates the random password string.
+*   **`|`**: This is the "pipe" operator. It sends the output of the command on its left as the input to the command on its right.
+*   **`sudo tee secrets/neo4j_password`**:
+    *   `tee` is a command that reads input and writes it to both the screen and a file.
+    *   By running `sudo tee`, the `tee` process itself has root privileges and therefore has permission to write the file `secrets/neo4j_password`.
+*   **`> /dev/null`**: We add this because `tee` also outputs to the screen by default. Piping the screen output to `/dev/null` (a special file that discards everything written to it) keeps your terminal clean.
+
+---
+
+### Step 4: Generate a TLS Certificate for Your IP Address (with SAN)
+
+Modern browsers and clients require the IP address to be in the **Subject Alternative Name (SAN)** field of a certificate. This command creates a certificate that is valid for your specific server IP.
+
+```bash
+# Set your server's IP address as an environment variable
+export SERVER_IP="YOUR_SERVER_IP"
+
+# Generate the key and certificate with the IP in both the CN and SAN fields
+# This single command works on most modern systems (OpenSSL ≥ 1.1.1)
+openssl req -x509 -newkey rsa:4096 -sha256 -days 365 -nodes \
+  -subj "/CN=${SERVER_IP}" \
+  -addext "subjectAltName = IP:${SERVER_IP}" \
+  -keyout certificates/private.key \
+  -out certificates/public.crt
+```
+**Why this is important:** Including the IP in the SAN is the modern standard and prevents hostname mismatch errors from clients, ensuring a secure and valid TLS connection.
+
+#### For localhost
+
+```bash
+openssl req -x509 -newkey rsa:4096 -sha256 -days 365 -nodes \
+  -subj "/CN=localhost" \
+  -addext "subjectAltName = DNS:localhost" \
+  -keyout certificates/private.key \
+  -out certificates/public.crt
+```
+
+* give access: ```sudo chown -R 101:101 certificates```
+
+---
+
+### Step 5: Configure Neo4j with Modern 5.x Settings
+
+Create the file `conf/neo4j.conf`. This configuration enforces encrypted-only connections and advertises the correct IP address to connecting clients.
+
+**Remember to replace `YOUR_SERVER_IP` in this file.**
+
+```ini
+# conf/neo4j.conf (Corrected for Neo4j 5.x)
+
+# ================= Network =================
+# Listen on all interfaces inside the container
+server.default_listen_address=0.0.0.0
+
+# Advertise the correct LAN IP to clients. CRITICAL for drivers and clustering.
+# For a LAN setup, uncomment and set this. For a pure localhost setup, leave it commented.
+# server.default_advertised_address=YOUR_SERVER_IP
+
+# ================= Connectors =================
+# Disable the insecure HTTP connector entirely.
+server.http.enabled=false
+
+# --- HTTPS Connector ---
+server.https.enabled=true
+server.https.listen_address=:7473
+# TLS configuration using SSL policy
+dbms.ssl.policy.https.enabled=true
+dbms.ssl.policy.https.base_directory=/certificates
+dbms.ssl.policy.https.private_key=private.key
+dbms.ssl.policy.https.public_certificate=public.crt
+
+# --- Bolt Connector ---
+server.bolt.enabled=true
+server.bolt.listen_address=:7687
+# Enforce encrypted connections for Bolt.
+server.bolt.tls_level=REQUIRED
+# Use the same SSL policy for Bolt
+dbms.ssl.policy.bolt.enabled=true
+dbms.ssl.policy.bolt.base_directory=/certificates
+dbms.ssl.policy.bolt.private_key=private.key
+dbms.ssl.policy.bolt.public_certificate=public.crt
+
+# ================= Security =================
+# Keep strict validation enabled. This is a critical security feature.
+server.config.strict_validation.enabled=true
+
+# ================= Memory (Tune for your machine) =================
+server.memory.heap.initial_size=4G
+server.memory.heap.max_size=4G
+server.memory.pagecache.size=8G
+```
+
+---
+
+### Step 6: Create the Docker Compose File
+
+Create the `docker-compose.yml` file. This is the heart of the deployment, binding the service specifically to your LAN IP and using the robust `cypher-shell` healthcheck.
+
+**Remember to replace `YOUR_SERVER_IP` in this file.**
+
+```yaml
+
+services:
+  neo4j:
+    image: neo4j:5-enterprise          # Tracks the latest 5.x version
+    container_name: neo4j_local_secure
+    restart: unless-stopped
+    user: "101:101"                    # Run as a non-root user
+
+    # Security: Bind host ports specifically to your LAN IP, not 0.0.0.0 (all interfaces).
+    ports:
+      - "YOUR_SERVER_IP:7473:7473"     # Secure HTTPS
+      - "YOUR_SERVER_IP:7687:7687"     # Secure Bolt
+
+    volumes:
+      - ./data:/data
+      - ./logs:/logs
+      - ./conf:/conf
+      - ./plugins:/plugins
+      - ./certificates:/certificates
+
+    environment:
+      - NEO4J_AUTH_FILE=/run/secrets/neo4j_auth_secret
+      - NEO4J_ACCEPT_LICENSE_AGREEMENT=yes
+
+    secrets:
+      - source: neo4j_auth_secret
+        target: neo4j_auth_secret
+
+    healthcheck:
+      # Robust check using cypher-shell to query the database directly.
+      # 'bolt+ssc' scheme trusts the self-signed certificate for the healthcheck.
+      test: ["CMD-SHELL", "PASS=$$(cut -d/ -f2 /run/secrets/neo4j_auth_secret) && cypher-shell -a bolt+ssc://localhost:7687 -u neo4j -p \"$$PASS\" 'RETURN 1' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+secrets:
+  neo4j_auth_secret:
+    file: ./secrets/neo4j_auth
+```
+
+#### For localhost:
+
+```bash
+    # Security: Bind host ports specifically to localhost (127.0.0.1).
+    ports:
+      - "127.0.0.1:7473:7473"     # Accessible only from https://localhost:7473
+      - "127.0.0.1:7687:7687"     # Accessible only from bolt+ssc://localhost:7687
+```
+
+---
+
+### Step 7: Launch, Verify, and Connect
+
+You are now ready to start the service and connect from another machine on your local network.
+
+```bash
+# 1. Start the service in the background
+docker compose up -d
+
+# 2. Check the status. Wait for the STATUS to become 'running (healthy)'
+docker compose ps
+
+# 3. (Optional) Follow the logs on first startup
+docker logs -f neo4j_local_secure
+```
+
+**How to Connect:**
+
+*   **Neo4j Browser:** Navigate to `https://YOUR_SERVER_IP:7473`
+    *   *You will see a security warning. This is expected. Click "Advanced" and proceed.*
+*   **Drivers & Tools:** Use a secure connection string. The `+ssc` scheme is a convenient shortcut that trusts self-signed certificates without needing a custom trust store.
+    *   `bolt+ssc://YOUR_SERVER_IP:7687`
+*   **`cypher-shell` from your host machine:**
+    ```bash
+    cypher-shell -a bolt+ssc://YOUR_SERVER_IP:7687 -u neo4j -p "$(cat secrets/neo4j_password)"
+    ```
+
+
+#### For Localhost: 
+**Local Port Forwarding** (or an "SSH Tunnel").
+
+you bound the ports to `127.0.0.1` on the server, you cannot connect to `https://YOUR_SERVER_IP:7473`. 
+
+The solution is to tell SSH to create a secure tunnel from your local machine, through the SSH connection, directly to the `localhost` port on the remote server.
+
+### The Concept
+
+You will forward a port on your **local machine** (the one you are typing on) to the Neo4j port on the **remote server's localhost**.
+
+*   Traffic going into `localhost:7473` on **your laptop**
+*   ...travels securely through the SSH connection...
+*   ...and comes out on `localhost:7473` on the **remote server**, where Neo4j is listening.
+
+### The Solution: The `-L` Flag in SSH
+
+You need to forward two ports: `7473` for the browser (HTTPS) and `7687` for the Bolt driver. You can do this in a single SSH command by using the `-L` flag twice.
+
+#### Step 1: Disconnect and Reconnect with Port Forwarding
+
+First, if you are currently connected to your server, `exit` that SSH session.
+
+Now, reconnect using the following command. This is the **only command you need to change**.
+
+```bash
+# General Syntax: ssh -L <local_port>:<destination_host>:<destination_port> user@server
+#
+# We will forward:
+# - Our local port 7473 to the remote server's localhost:7473
+# - Our local port 7687 to the remote server's localhost:7687
+
+ssh -L 7473:localhost:7473 -L 7687:localhost:7687 vpa@172.22.11.241
+```
+
+**Command Breakdown:**
+
+*   **`ssh user@the.server.ip.addreess`**: Your standard SSH login command.
+*   **`-L 7473:localhost:7473`**:
+    *   `-L`: Specifies **L**ocal port forwarding.
+    *   `7473`: The port to open on **your local machine**.
+    *   `localhost`: The destination host *from the remote server's perspective*. We want to connect to `localhost` on the server.
+    *   `7473`: The destination port on the remote server.
+*   **`-L 7687:localhost:7687`**: Does the same thing for the Bolt port.
+
+#### Step 2: Keep the SSH Connection Open
+
+As long as this SSH terminal window is open, the secure tunnels are active. If you close this window, the tunnels will close.
+
+#### Step 3: Connect Using `localhost` on Your Local Machine
+
+Now, on your local machine (your laptop), you can access Neo4j as if it were running locally.
+
+*   **Open Your Web Browser (on your laptop):**
+    Navigate to: `https://localhost:7473`
+    *   Your browser will send the request to your local port 7473.
+    *   SSH will intercept it, send it through the tunnel, and deliver it to Neo4j on the server.
+    *   You will still see the security warning for the self-signed certificate, which is expected.
+
+*   **Use `cypher-shell` or a Driver (from your laptop):**
+    Use the connection string: `bolt+ssc://localhost:7687`
+    ```bash
+    # You would run this in a NEW terminal window on your local machine,
+    # NOT in the SSH window.
+    cypher-shell -a bolt+ssc://localhost:7687 -u neo4j -p "YOUR_SECURE_PASSWORD"
+    ```
+
+This is the standard and most secure way to manage services that are intentionally not exposed to the network. You maintain a very high level of security on the server while still having full access for management from your trusted machine.
+
+---
+
+### Step 8: Harden with a Firewall (Recommended)
+
+For true defense-in-depth, configure a firewall on the host machine to only allow traffic to the Neo4j ports from your trusted local network.
+
+**UFW (Ubuntu) Example:**
+
+```bash
+# Replace with your LAN subnet (e.g., 192.168.1.0/24)
+export LAN_SUBNET="YOUR_LAN_SUBNET"
+
+# Allow incoming connections from the LAN to the Neo4j ports
+sudo ufw allow from ${LAN_SUBNET} to any port 7473 proto tcp
+sudo ufw allow from ${LAN_SUBNET} to any port 7687 proto tcp
+
+# Ensure UFW is enabled and check the status
+sudo ufw enable
+sudo ufw status
+```
+**Why this is important:** Even if Docker is bound to a specific IP, the firewall acts as a second, powerful layer of defense against unwanted network access.
+
+
+# Connecting to Your Secure Neo4j Docker Instance
+
+This guide provides detailed instructions on how to connect to and verify your secure Neo4j 5.x Docker container. It covers all common scenarios, including connecting from the host machine, a remote machine on the same network, and securely through an SSH tunnel.
+
+## Prerequisites
+
+Before you begin, ensure you have the following information and tools:
+
+1.  **Server IP Address**: The LAN IP address of the machine hosting the Docker container (e.g., `192.168.1.101`). This will be referred to as `YOUR_SERVER_IP`.
+2.  **Neo4j Password**: The secure password you generated. You can retrieve it from the host machine at any time by running:
+    ```bash
+    # Run this from your neo4j-local-secure directory
+    sudo cat secrets/neo4j_password
+    ```
+3.  **`cypher-shell`**: The official Neo4j command-line interface. This must be installed on any machine you wish to connect from.
+
+---
+
+## Connection Methods
+
+The correct connection method depends on how you configured the `ports` section in your `docker-compose.yml` file.
+
+### Scenario 1: Ports are Bound to Your Server's LAN IP
+
+This is the standard setup for making Neo4j available to other machines on your local network. Your `docker-compose.yml` `ports` section looks like this:
+
+```yaml
+    ports:
+      - "YOUR_SERVER_IP:7473:7473" # Secure HTTPS
+      - "YOUR_SERVER_IP:7687:7687" # Secure Bolt
+```
+
+#### ► Method 1: Connecting from the Host Machine Terminal
+
+This is the most direct way to interact with the database.
+
+1.  **Open a terminal** on the machine running the Docker container.
+2.  **Navigate** to your `neo4j-local-secure` project directory.
+3.  **Run the `cypher-shell` command**:
+
+    ```bash
+    cypher-shell \
+      -a "bolt+ssc://YOUR_SERVER_IP:7687" \
+      -u neo4j \
+      -p "$(sudo cat secrets/neo4j_password)"
+    ```
+    > **Note**: The `+ssc` in the address tells the client to trust the server's **S**elf-**S**igned **C**ertificate, which is exactly what we need for this setup.
+
+4.  **Verify the connection** as described in the [Verification](#verification) section below.
+
+#### ► Method 2: Connecting from a Remote Machine Terminal
+
+You can connect from any other computer on the same LAN that has `cypher-shell` installed.
+
+1.  **Open a terminal** on your remote machine (e.g., your laptop).
+2.  **Run the `cypher-shell` command**. You will be prompted to enter your password securely.
+
+    ```bash
+    cypher-shell -a "bolt+ssc://YOUR_SERVER_IP:7687" -u neo4j
+    ```
+3.  **Enter your password** when prompted.
+4.  **Verify the connection** as described in the [Verification](#verification) section.
+
+#### ► Method 3: Connecting via Web Browser
+
+You can access the Neo4j Browser from any machine on the same LAN.
+
+1.  **Open your web browser** (Chrome, Firefox, etc.).
+2.  **Navigate to the following URL**:
+    `https://YOUR_SERVER_IP:7473`
+3.  **Handle the Security Warning**: Your browser will show a privacy or security warning because the certificate is self-signed. This is expected.
+    *   Click **"Advanced"**.
+    *   Click **"Proceed to YOUR_SERVER_IP (unsafe)"** or "Accept the Risk and Continue".
+4.  **Log in**: Use `neo4j` as the username and your secure password. The connection URI should default to `bolt://YOUR_SERVER_IP:7687`.
+5.  Click **Connect**.
+
+---
+
+### Scenario 2: Ports are Bound to `localhost` (127.0.0.1)
+
+This is a high-security setup where the database is not exposed to the network at all. Remote access is only possible via a secure SSH tunnel. Your `docker-compose.yml` `ports` section looks like this:
+
+```yaml
+    ports:
+      - "127.0.0.1:7473:7473"
+      - "127.0.0.1:7687:7687"
+```
+
+#### ► Method 1: Connecting from the Host Machine (Terminal & Browser)
+
+Connecting from the host is simple because you are already on `localhost`.
+
+*   **Terminal**:
+    ```bash
+    cypher-shell \
+      -a "bolt+ssc://localhost:7687" \
+      -u neo4j \
+      -p "$(sudo cat secrets/neo4j_password)"
+    ```
+*   **Browser**:
+    1.  Navigate to `https://localhost:7473`.
+    2.  Bypass the security warning as explained above.
+    3.  Log in with your credentials.
+
+#### ► Method 2: Connecting from a Remote Machine (via SSH Tunnel)
+
+This is the standard, secure way to manage a service that is not exposed to the network.
+
+1.  **Establish the SSH Tunnel**: From your remote machine's terminal, run the following command to connect to your server. This command forwards your local ports `7473` and `7687` through the SSH connection to the server's `localhost`.
+
+    ```bash
+    # Syntax: ssh -L <local_port>:<destination_host>:<destination_port> user@server
+    ssh -L 7473:localhost:7473 -L 7687:localhost:7687 your_user@YOUR_SERVER_IP
+    ```
+    **Important**: You must keep this SSH terminal window open. The tunnel remains active only as long as this connection is open.
+
+2.  **Connect in a *New* Terminal or Browser**: With the tunnel active, open a **new** terminal window or your browser on your remote machine and connect to `localhost` as if Neo4j were running locally.
+
+    *   **New Terminal**:
+        ```bash
+        # Connect to your local port, which SSH will forward to the server
+        cypher-shell -a "bolt+ssc://localhost:7687" -u neo4j
+        ```
+    *   **Browser**:
+        1.  Navigate to `https://localhost:7473`.
+        2.  Bypass the security warning.
+        3.  Log in. Your traffic will be securely tunneled to the server.
+
+---
+
+## Verification
+
+A successful connection can be confirmed in two ways.
+
+### In `cypher-shell`
+
+Upon successful connection, your terminal prompt will change to:
+`neo4j@bolt+ssc://...> `
+
+Run this basic command to confirm the database is responsive:
+
+```cypher
+SHOW DATABASES;
+```
+
+A successful query will return a table of the available databases:
+
+```
++--------------------------------------------------------------------------------------------+
+| name     | type       | aliases | access      | address               | role      | writer |
++--------------------------------------------------------------------------------------------+
+| "neo4j"  | "standard" | []      | "read-write"| "localhost:7687"      | "primary" | TRUE   |
+| "system" | "system"   | []      | "read-write"| "localhost:7687"      | "primary" | TRUE   |
++--------------------------------------------------------------------------------------------+
+```
+
+To exit the shell, type `:exit` and press Enter.
+
+### In Neo4j Browser
+
+After logging in, you will see the main Neo4j Browser interface. The top-left corner will show that you are connected to the database, and you can type Cypher queries into the editor at the top of the screen.
+
+
+---
+
+# Managing Graph Data in Your Secure Neo4j Docker Instance
+
+This guide provides essential instructions for managing the data within your Neo4j database. It covers how to perform logical exports of your entire graph into portable formats and how to completely clear the database of all nodes and relationships for a clean reset.
+
+These operations are performed while the database is running and do not require you to stop the container.
+
+## Table of Contents
+- [Prerequisite: Installing the APOC Plugin](#prerequisite-installing-the-apoc-plugin)
+- [Exporting All Graph Data](#exporting-all-graph-data)
+- [Deleting All Graph Data](#deleting-all-graph-data)
+
+---
+
+## Prerequisite: Installing the APOC Plugin
+
+The most powerful and flexible way to manage data is with the **APOC ("Awesome Procedures On Cypher")** library. This is a one-time setup.
+
+1.  **Download APOC**: Go to the [APOC Releases page](https://github.com/neo4j-contrib/neo4j-apoc-procedures/releases) and find the release that **exactly matches your Neo4j version**. For example, if you are using Neo4j `5.26.10`, download the APOC `5.26.10` JAR file.
+    *   Under the "Assets" section, download the file named `apoc-x.x.x-core.jar`.
+
+2.  **Place the Plugin**: Move the downloaded `.jar` file into the `./plugins` directory of your project on the host machine.
+    ```bash
+    # Example command
+    mv ~/Downloads/apoc-5.26.10-core.jar ./plugins/
+    ```
+
+3.  **Configure Neo4j to Allow APOC**: Edit your `conf/neo4j.conf` file and add the following line. This gives APOC the necessary permissions to perform operations like writing files.
+
+    ```ini
+    # Add this line to the end of your conf/neo4j.conf
+    dbms.security.procedures.unrestricted=apoc.*
+    ```
+
+4.  **Restart the Container**: To load the plugin and apply the new configuration, restart your Docker service from your project directory.
+    ```bash
+    docker compose down && docker compose up -d
+    ```
+
+---
+
+## Exporting All Graph Data
+
+These procedures export your data into files saved on the host machine, making them easy to access, share, or use for migration.
+
+#### Setup: Create a Shared Directory for Exports
+
+To easily retrieve exported files, we'll map a local directory into the container.
+
+1.  **Create an `exports` directory** on your host:
+    ```bash
+    mkdir ./exports
+    ```
+2.  **Add the volume to `docker-compose.yml`**:
+    ```yaml
+    # in your docker-compose.yml
+    services:
+      neo4j:
+        # ... other settings
+        volumes:
+          - ./data:/data
+          - ./logs:/logs
+          - ./conf:/conf
+          - ./plugins:/plugins
+          - ./certificates:/certificates
+          - ./exports:/exports   # <--- ADD THIS LINE
+    ```
+3.  **Restart the container** if you just added the volume: `docker compose up -d --force-recreate`.
+
+#### ► Export Option 1: Cypher Script
+This method creates a single `.cypher` file containing all the `CREATE` statements needed to perfectly rebuild your graph. It is ideal for backups and migrations to other Neo4j instances.
+
+Connect to your database via `cypher-shell` or the Neo4j Browser and run:
+```cypher
+/*
+  This procedure will create a 'all-data.cypher' file
+  inside the ./exports directory on your host machine.
+*/
+CALL apoc.export.cypher.all('all-data.cypher', {
+  format: 'cypher-shell',
+  useOptimizations: {type: 'UNWIND', unwindBatchSize: 100}
+});
+```
+
+#### ► Export Option 2: GraphML
+GraphML is a standard XML-based format that can be imported into other graph visualization and analysis tools, such as Gephi.
+
+```cypher
+/*
+  This procedure will create a 'all-data.graphml' file
+  inside the ./exports directory on your host machine.
+*/
+CALL apoc.export.graphml.all('all-data.graphml', {});
+```
+
+---
+
+## Deleting All Graph Data
+
+This action removes **all nodes and relationships** from your `neo4j` database. It does **not** remove your user accounts, and it leaves your schema (indexes and constraints) intact.
+
+#### ► Method 1: Simple Delete (For Small to Medium Graphs)
+This command is easy to remember and effective for databases that are not excessively large.
+
+```cypher
+MATCH (n) DETACH DELETE n;
+```
+> **Warning**: On very large graphs (millions of nodes/edges), this single transaction can consume a large amount of memory and may fail. For large datasets, use the batched method below.
+
+#### ► Method 2: Batched Delete (For Very Large Graphs)
+This is the recommended, robust method for clearing any size of graph. It uses an APOC procedure to delete nodes in smaller, manageable batches, preventing memory issues.
+
+```cypher
+/*
+  This procedure finds all nodes and runs DETACH DELETE on them in
+  batches of 50,000 until the database is empty.
+*/
+CALL apoc.periodic.iterate(
+  'MATCH (n) RETURN n',
+  'DETACH DELETE n',
+  {batchSize: 50000}
+)
+YIELD batches, total;
+```
+
+#### Verification
+After running a delete command, you can confirm the database is empty with the following query. The expected result is `0`.
+```cypher
+MATCH (n) RETURN count(n);
+```
+
+================================================================================
+--- File: requirements.txt ---
+================================================================================
+
+# --- Web Framework & Server ---
+fastapi
+uvicorn[standard]
+
+# --- Graph & Database ---
+graphiti-core
+neo4j
+
+# --- Configuration ---
+pydantic-settings
+python-dotenv
+
+# --- AI/ML Service Clients ---
+openai
+aiohttp
+
+# --- Embedder & Tokenizer Dependencies ---
+transformers
+numpy~=1.26.4
+torch
+sentencepiece
+
+================================================================================
+--- File: .env ---
+================================================================================
+
+# .env
+
+# --- Application Settings ---
+LOG_LEVEL="INFO"
+
+# --- Neo4j Connection ---
+NEO4J_URI="bolt+ssc://localhost:7687"
+NEO4J_USER="neo4j"
+NEO4J_PASSWORD="UZC96B9INkLB0b2uwjZBJ1UUXciwSzMeRB1ECSQM94M="
+
+# --- vLLM (Gemma LLM) Connection ---
+VLLM_BASE_URL="http://localhost:5000/v1"
+VLLM_API_KEY="Va4tyaK+99NG8CQBUZWxeLzlCaMCamwMoLKEbhrfO5U="
+VLLM_MODEL_NAME="RedHatAI/gemma-3-27b-it-FP8-dynamic"
+
+# --- Triton (Jina Embedder) Connection ---
+TRITON_URL="http://localhost:4000"
+
+================================================================================
+--- File: setup.py ---
+================================================================================
+
+from setuptools import setup, find_packages
+
+setup(name='graphiti-ingestion-service', version='0.1.0', packages=find_packages())
+
+================================================================================
+--- File: .env.example ---
+================================================================================
+
+# .env
+
+# --- Application Settings ---
+LOG_LEVEL="INFO"
+
+# --- Neo4j Connection ---
+NEO4J_URI="bolt+ssc://localhost:7687"
+NEO4J_USER="neo4j"
+NEO4J_PASSWORD="your-neo4j-secure-password"
+
+# --- vLLM (Gemma LLM) Connection ---
+VLLM_BASE_URL="http://localhost:5000/v1"
+VLLM_API_KEY="YOUR_SUPER_SECRET_KEY"
+VLLM_MODEL_NAME="RedHatAI/gemma-3-27b-it-FP8-dynamic"
+
+# --- Triton (Jina Embedder) Connection ---
+TRITON_URL="http://localhost:4000"
+
+================================================================================
+--- File: graphiti_ingestion/config.py ---
+================================================================================
+
+import logging
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
+
+
+class Settings(BaseSettings):
+    """
+    Defines the application's configuration settings, loaded from a .env file.
+    """
+    # --- Application Settings ---
+    LOG_LEVEL: str = "INFO"
+
+    # --- Neo4j Connection ---
+    NEO4J_URI: str
+    NEO4J_USER: str
+    NEO4J_PASSWORD: str
+
+    # --- vLLM (Gemma LLM) Connection ---
+    VLLM_BASE_URL: str
+    VLLM_API_KEY: str
+    # The model name must match the one vLLM is serving
+    VLLM_MODEL_NAME: str
+
+    # --- Triton (Jina Embedder) Connection ---
+    TRITON_URL: str
+
+    # Pydantic-settings configuration
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"  # Ignore extra fields in the environment
+    )
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """
+    Returns the singleton instance of the Settings object.
+
+    The @lru_cache decorator ensures that the Settings are loaded from the
+    .env file only once, making it an efficient way to access configuration.
+    """
+    logger.info("Loading application settings from .env file...")
+    try:
+        settings = Settings()
+        return settings
+    except Exception as e:
+        logger.error(f"Failed to load settings: {e}")
+        raise
+
+
+# You can optionally log the loaded settings on startup for verification
+# settings = get_settings()
+# logger.debug(f"Loaded settings: {settings.model_dump(exclude={'NEO4J_PASSWORD', 'VLLM_API_KEY'})}")
+
+================================================================================
+--- File: graphiti_ingestion/__init__.py ---
+================================================================================
+
+
+
+================================================================================
+--- File: graphiti_ingestion/api/episodes.py ---
+================================================================================
+
+import uuid
+from fastapi import APIRouter, Depends, HTTPException, status
+
+# The imports now correctly reference the 'graphiti_ingestion' package.
+# These files will be created in the upcoming steps.
+from graphiti_ingestion.models.episodes import (
+    EpisodeRequest,
+    EpisodeResponse,
+    JobStatusResponse,
+)
+from graphiti_ingestion.services.task_queue import TaskQueue, get_task_queue
+
+router = APIRouter(
+    prefix="/episodes",
+    tags=["Episodes"],
+    responses={404: {"description": "Not found"}},
+)
+
+
+@router.post(
+    "/",
+    response_model=EpisodeResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Submit an episode for ingestion",
+    description="Accepts an episode's content, type, and description, then adds it to a background processing queue.",
+)
+async def submit_episode(
+    episode_request: EpisodeRequest,
+    task_queue: TaskQueue = Depends(get_task_queue),
+):
+    """
+    Submits a new episode to the ingestion queue.
+
+    This endpoint is non-blocking. It generates a unique job ID for the request,
+    places it in the queue for background processing, and immediately returns the
+    job ID to the client.
+
+    Args:
+        episode_request: The episode data payload from the client.
+        task_queue: The dependency-injected task queue service.
+
+    Returns:
+        An EpisodeResponse containing the job_id and initial status.
+    """
+    job_id = str(uuid.uuid4())
+    await task_queue.submit_job(job_id, episode_request.model_dump())
+
+    return EpisodeResponse(
+        job_id=job_id,
+        status="pending",
+        message="Episode accepted for processing.",
+    )
+
+
+@router.get(
+    "/status/{job_id}",
+    response_model=JobStatusResponse,
+    summary="Check the status of an ingestion job",
+    description="Retrieves the current processing status of an episode submitted previously.",
+)
+async def get_job_status(
+    job_id: str,
+    task_queue: TaskQueue = Depends(get_task_queue),
+):
+    """
+    Retrieves the status of a specific ingestion job by its ID.
+
+    Args:
+        job_id: The unique identifier for the job.
+        task_queue: The dependency-injected task queue service.
+
+    Returns:
+        The current status of the job (pending, processing, completed, or failed).
+    
+    Raises:
+        HTTPException: If the job_id is not found.
+    """
+    status_info = await task_queue.get_job_status(job_id)
+
+    if status_info is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job with ID '{job_id}' not found.",
+        )
+
+    return JobStatusResponse(**status_info)
+
+================================================================================
+--- File: graphiti_ingestion/services/task_queue.py ---
+================================================================================
+
+import asyncio
+from typing import Any, Dict, Optional
+
+
+class TaskQueue:
+    """
+    A simple in-memory, asynchronous task queue and status tracker.
+    
+    This class manages a queue of jobs to be processed and stores the status
+    of each job.
+    """
+
+    def __init__(self):
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.job_statuses: Dict[str, Dict[str, Any]] = {}
+
+    async def submit_job(self, job_id: str, data: Dict[str, Any]):
+        """
+        Adds a new job to the queue and sets its initial status.
+
+        Args:
+            job_id: A unique identifier for the job.
+            data: The payload of the job to be processed.
+        """
+        initial_status = {
+            "job_id": job_id,
+            "status": "pending",
+            "message": "Job is waiting in the queue.",
+        }
+        self.job_statuses[job_id] = initial_status
+        await self.queue.put({"job_id": job_id, "data": data})
+
+    async def get_job_status(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieves the status of a specific job.
+
+        Args:
+            job_id: The unique identifier for the job.
+
+        Returns:
+            A dictionary with the job's status, or None if the job_id is not found.
+        """
+        return self.job_statuses.get(job_id)
+
+    async def get_job(self) -> Dict[str, Any]:
+        """
+        Waits for and retrieves the next job from the queue.
+        This is typically called by a background worker.
+        """
+        return await self.queue.get()
+
+    async def update_job_status(self, job_id: str, status: str, message: Optional[str] = None):
+        """
+        Updates the status and message of a job.
+
+        Args:
+            job_id: The unique identifier for the job.
+            status: The new status (e.g., "processing", "completed", "failed").
+            message: An optional message, useful for error details.
+        """
+        if job_id in self.job_statuses:
+            self.job_statuses[job_id]["status"] = status
+            self.job_statuses[job_id]["message"] = message
+
+    def mark_task_done(self):
+        """
+        Signals that a formerly enqueued task is complete.
+        Called by the worker after processing a job.
+        """
+        self.queue.task_done()
+
+
+# --- Dependency Injection Singleton ---
+# This ensures that the entire application uses the same instance of TaskQueue.
+_task_queue_instance = TaskQueue()
+
+
+def get_task_queue() -> TaskQueue:
+    """
+    FastAPI dependency to get the singleton instance of the TaskQueue.
+    """
+    return _task_queue_instance
+
+================================================================================
+--- File: graphiti_ingestion/services/graphiti_service.py ---
+================================================================================
+
+import json
+import logging
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
+from openai import AsyncOpenAI
+
+from graphiti_core import Graphiti
+from graphiti_core.llm_client import LLMConfig, OpenAIClient
+from graphiti_ingestion.core.compatible_openai_client import CompatibleOpenAIClient
+from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
+from graphiti_core.nodes import EpisodeType
+
+# Note: These imports will resolve once we create the corresponding files.
+from graphiti_ingestion.config import Settings, get_settings
+from graphiti_ingestion.core.jina_triton_embedder import (
+    JinaV3TritonEmbedder,
+    JinaV3TritonEmbedderConfig,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class GraphitiService:
+    """
+    A service class to manage the Graphiti instance and its dependencies.
+
+    This class handles the lifecycle of the Graphiti client, including the
+    configuration and instantiation of the LLM and embedder clients.
+    """
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.graphiti: Graphiti
+        self.jina_embedder: JinaV3TritonEmbedder
+
+        # 1. Configure the LLM Client (vLLM OpenAI-compatible server)
+        llm_client_vllm = AsyncOpenAI(
+            api_key=self.settings.VLLM_API_KEY,
+            base_url=self.settings.VLLM_BASE_URL,
+        )
+
+        # The model name here MUST match the model ID served by vLLM
+        vllm_llm_config = LLMConfig(
+            small_model=self.settings.VLLM_MODEL_NAME,
+            model=self.settings.VLLM_MODEL_NAME,
+        )
+
+        # 2. Configure the Embedder Client (Jina Triton Server)
+        jina_config = JinaV3TritonEmbedderConfig(
+            triton_url=self.settings.TRITON_URL
+        )
+        self.jina_embedder = JinaV3TritonEmbedder(config=jina_config)
+
+        # 3. Initialize Graphiti with all components
+        self.graphiti = Graphiti(
+            uri=self.settings.NEO4J_URI,
+            user=self.settings.NEO4J_USER,
+            password=self.settings.NEO4J_PASSWORD,
+            llm_client=CompatibleOpenAIClient(
+                config=vllm_llm_config,
+                client=llm_client_vllm
+            ),
+            embedder=self.jina_embedder,
+            # CHANGE: Explicitly configure the cross_encoder to use your vLLM server.
+            cross_encoder=OpenAIRerankerClient(
+                config=vllm_llm_config,  # Reuse the same config
+                client=llm_client_vllm   # Reuse the same client
+            )
+        )
+        logger.info("GraphitiService initialized.")
+
+    async def startup(self):
+        """
+        Initializes connections and builds necessary database constraints/indices.
+        This should be called once when the application starts.
+        """
+        logger.info("Building Graphiti indices and constraints...")
+        await self.graphiti.build_indices_and_constraints()
+        logger.info("Graphiti indices and constraints are set up.")
+
+    async def shutdown(self):
+        """
+        Closes all connections gracefully.
+        This should be called once when the application shuts down.
+        """
+        logger.info("Closing Graphiti connections...")
+        await self.graphiti.close()
+        await self.jina_embedder.close()
+        logger.info("Graphiti connections closed.")
+
+    async def process_and_add_episode(self, episode_data: dict):
+        """
+        Processes a single episode payload and adds it to the graph.
+
+        Args:
+            episode_data: A dictionary containing the episode's content,
+                          type, and description.
+        """
+        content = episode_data["content"]
+        episode_type_str = episode_data["type"]
+        description = episode_data["description"]
+        
+        # Map the string type from the API to the Graphiti Enum
+        episode_type_enum = EpisodeType[episode_type_str]
+
+        # Ensure JSON content is serialized to a string for Graphiti
+        if episode_type_enum == EpisodeType.json:
+            episode_body = json.dumps(content)
+        else:
+            episode_body = content
+        
+        episode_name = f"Ingested Episode - {datetime.now(timezone.utc).isoformat()}"
+
+        logger.info(f"Adding episode '{episode_name}' of type '{episode_type_str}' to the graph.")
+        
+        await self.graphiti.add_episode(
+            name=episode_name,
+            episode_body=episode_body,
+            source=episode_type_enum,
+            source_description=description,
+            reference_time=datetime.now(timezone.utc),
+        )
+        logger.info(f"Successfully added episode '{episode_name}'.")
+
+
+# --- Dependency Injection Singleton ---
+_graphiti_service_instance: Optional[GraphitiService] = None
+
+
+def get_graphiti_service() -> GraphitiService:
+    """
+    FastAPI dependency to get the singleton instance of the GraphitiService.
+    The instance is created by the application's lifespan event manager.
+    """
+    if _graphiti_service_instance is None:
+        # This state should not be reached in a running FastAPI app
+        # because the lifespan event handler initializes it on startup.
+        raise RuntimeError("GraphitiService has not been initialized.")
+    return _graphiti_service_instance
+
+
+def initialize_graphiti_service():
+    """
+    Creates and stores the singleton instance of the GraphitiService.
+    This is called from the main application's startup event.
+    """
+    global _graphiti_service_instance
+    if _graphiti_service_instance is None:
+        logger.info("Creating singleton instance of GraphitiService.")
+        settings = get_settings()
+        _graphiti_service_instance = GraphitiService(settings)
+    return _graphiti_service_instance
+
+================================================================================
+--- File: graphiti_ingestion/core/jina_triton_embedder.py ---
+================================================================================
+
+# jina_triton_embedder.py
+
+import json
+import logging
+from typing import List, Dict, Any, Optional, Union
+
+import aiohttp
+import numpy as np
+from pydantic import Field
+from transformers import AutoTokenizer
+
+from graphiti_core.embedder.client import EmbedderClient, EmbedderConfig
+
+logger = logging.getLogger(__name__)
+
+
+class JinaV3TritonEmbedderConfig(EmbedderConfig):
+    """
+    Configuration for the JinaV3TritonEmbedder.
+    
+    This configures the connection to a Triton server running separate
+    Jina V3 query and passage embedding models.
+    """
+    triton_url: str = Field(
+        description="Base URL for the Triton Inference Server, e.g., 'http://localhost:4000'"
+    )
+    query_model_name: str = Field(
+        default="jina_query",
+        description="Name of the query embedding model in Triton."
+    )
+    passage_model_name: str = Field(
+        default="jina_passage",
+        description="Name of the passage/document embedding model in Triton."
+    )
+    tokenizer_name: str = Field(
+        default="jinaai/jina-embeddings-v3",
+        description="Hugging Face tokenizer name for Jina V3."
+    )
+    triton_output_name: str = Field(
+        default="text_embeds",
+        description="The name of the output tensor from the Triton model."
+    )
+    batch_size: int = Field(
+        default=8,
+        description="Number of texts to process in a single batch request to Triton."
+    )
+    request_timeout: int = Field(
+        default=60,
+        description="Request timeout in seconds."
+    )
+
+
+class JinaV3TritonEmbedder(EmbedderClient):
+    """
+    An embedder client that connects to Jina V3 models hosted on Triton,
+    compatible with the graphiti-core framework.
+    """
+
+    def __init__(
+        self,
+        config: JinaV3TritonEmbedderConfig,
+        client_session: Optional[aiohttp.ClientSession] = None,
+    ):
+        """
+        Initializes the embedder.
+
+        Args:
+            config: The configuration object with Triton and model details.
+            client_session: An optional aiohttp session. If not provided, one will be created.
+        """
+        super().__init__()
+        self.config = config
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.tokenizer_name)
+        
+        self._client_session = client_session
+        self._owns_session = client_session is None
+        
+        logger.info(f"JinaV3TritonEmbedder configured for Triton at {self.config.triton_url}")
+
+    @property
+    async def client_session(self) -> aiohttp.ClientSession:
+        """Provides a lazily-initialized aiohttp.ClientSession."""
+        if self._client_session is None:
+            logger.debug("Creating new aiohttp.ClientSession")
+            self._client_session = aiohttp.ClientSession()
+        return self._client_session
+
+    def _build_triton_payload(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> Dict[str, Any]:
+        """Constructs the JSON payload for Triton."""
+        return {
+            "inputs": [
+                {
+                    "name": "input_ids",
+                    "shape": list(input_ids.shape),
+                    "datatype": "INT64",
+                    "data": input_ids.flatten().tolist()
+                },
+                {
+                    "name": "attention_mask",
+                    "shape": list(attention_mask.shape),
+                    "datatype": "INT64",
+                    "data": attention_mask.flatten().tolist()
+                }
+            ],
+            "outputs": [{"name": self.config.triton_output_name}]
+        }
+    
+    async def _embed_batch(self, texts: List[str], model_name: str) -> List[List[float]]:
+        """
+        Asynchronously tokenizes, sends a request to Triton, and post-processes a single batch.
+        """
+        if not texts:
+            return []
+
+        api_url = f"{self.config.triton_url.rstrip('/')}/v2/models/{model_name}/infer"
+        
+        tokens = self.tokenizer(
+            texts, padding=True, truncation=True, max_length=8192, return_tensors="np"
+        )
+        input_ids = tokens["input_ids"].astype(np.int64)
+        attention_mask = tokens["attention_mask"].astype(np.int64)
+        
+        payload = self._build_triton_payload(input_ids, attention_mask)
+        session = await self.client_session
+        
+        try:
+            async with session.post(
+                api_url,
+                data=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+                timeout=self.config.request_timeout
+            ) as response:
+                response.raise_for_status()
+                response_json = await response.json()
+
+            output_data = next((out for out in response_json['outputs'] if out['name'] == self.config.triton_output_name), None)
+            if output_data is None:
+                raise ValueError(f"Triton response did not contain '{self.config.triton_output_name}' output.")
+
+            shape = output_data['shape']
+            flat_embeddings = np.array(output_data['data'], dtype=np.float32)
+            last_hidden_state = flat_embeddings.reshape(shape)
+
+            input_mask_expanded = np.expand_dims(attention_mask, -1)
+            sum_embeddings = np.sum(last_hidden_state * input_mask_expanded, 1)
+            sum_mask = np.maximum(input_mask_expanded.sum(1), 1e-9)
+            pooled_embeddings = sum_embeddings / sum_mask
+
+            normalized_embeddings = pooled_embeddings / np.linalg.norm(pooled_embeddings, ord=2, axis=1, keepdims=True)
+            return normalized_embeddings.tolist()
+
+        except aiohttp.ClientResponseError as e:
+            error_body = await response.text()
+            logger.error(f"HTTP Error {e.status} connecting to Triton: {e.message}. Response: {error_body}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to get embeddings from Triton at {api_url}. Error: {e}")
+            raise
+
+    async def create(self, input_data: Union[str, List[str]]) -> List[float]:
+        """
+        Creates an embedding for a single input string (typically a query).
+        This method handles either a single string or a list containing one string,
+        to be compatible with how Graphiti's internal search calls it.
+        This method uses the QUERY model.
+        """
+        text_to_embed = ""
+        if isinstance(input_data, str):
+            text_to_embed = input_data
+        elif isinstance(input_data, list) and len(input_data) > 0:
+            text_to_embed = input_data[0]  # Extract the string from the list
+
+        if not text_to_embed or not isinstance(text_to_embed, str):
+            raise TypeError(
+                f"create() expects a non-empty string or a list with one string, but got {type(input_data)}"
+            )
+
+        embeddings = await self._embed_batch([text_to_embed], self.config.query_model_name)
+
+        if not embeddings:
+            raise ValueError("API returned no embedding for the input.")
+
+        return embeddings[0]
+    
+
+    async def create_batch(self, input_data_list: List[str]) -> List[List[float]]:
+        """
+        Creates embeddings for a batch of strings (typically passages or documents).
+        This method uses the PASSAGE model.
+        """
+        if not input_data_list:
+            return []
+
+        all_embeddings = []
+        for i in range(0, len(input_data_list), self.config.batch_size):
+            batch_texts = input_data_list[i:i + self.config.batch_size]
+            batch_embeddings = await self._embed_batch(batch_texts, self.config.passage_model_name)
+            all_embeddings.extend(batch_embeddings)
+        return all_embeddings
+
+    async def close(self):
+        """Close the underlying aiohttp client session if it was created by this instance."""
+        if self._client_session and self._owns_session:
+            await self._client_session.close()
+            self._client_session = None
+
+================================================================================
+--- File: graphiti_ingestion/core/compatible_openai_client.py ---
+================================================================================
+
+# graphiti_ingestion/core/compatible_openai_client.py
+
+import logging
+from typing import Any
+
+from graphiti_core.llm_client.config import ModelSize
+from graphiti_core.llm_client.openai_client import OpenAIClient
+from graphiti_core.prompts.models import Message
+from pydantic import BaseModel
+
+# Import our new, self-healing repair service
+from .repair_service import repair_and_validate
+
+# Use Python's standard logging module
+logger = logging.getLogger(__name__)
+
+
+class CompatibleOpenAIClient(OpenAIClient):
+    """
+    A robust, production-grade OpenAI client that uses a two-tiered repair strategy
+    (programmatic and LLM-powered self-healing) to ensure compatibility with
+    instruction-tuned models.
+
+    This client's primary role is to act as an orchestrator. It retrieves the raw
+    response from the LLM and then delegates the complex task of fixing and
+    validating the JSON payload to a dedicated repair service.
+    """
+
+    async def generate_response(
+        self,
+        messages: list[Message],
+        response_model: type[BaseModel] | None = None,
+        max_tokens: int | None = None,
+        model_size: ModelSize = ModelSize.medium,
+    ) -> dict[str, Any]:
+        """
+        Generates a response from the LLM, then uses a dedicated, self-healing
+        service to repair and validate the output before returning it.
+        """
+        # Step 1: Get the raw dictionary from the underlying LLM.
+        # We pass `response_model=None` to the parent class's method. This is a
+        # critical step that prevents the original OpenAIClient from attempting
+        # its own Pydantic validation, which would fail on the malformed JSON.
+        # We are taking over the validation responsibility.
+        logger.debug("Calling parent OpenAIClient to get raw LLM response...")
+        raw_response_dict = await super().generate_response(
+            messages, response_model=None, max_tokens=max_tokens, model_size=model_size
+        )
+
+        # Step 2: If the original call did not expect a structured response,
+        # there is nothing to repair or validate. Return immediately.
+        if not response_model:
+            logger.debug("No response_model expected. Returning raw response.")
+            return raw_response_dict
+
+        # Step 3: Delegate the entire repair and validation process to our robust service.
+        # We pass in all the necessary context:
+        # - `raw_dict`: The potentially messy JSON from the LLM.
+        # - `response_model`: The Pydantic class we need the output to conform to.
+        # - `llm_client`: A reference to this client instance (`self`), which the
+        #   service needs to make a self-healing API call if the first repair fails.
+        # - `original_messages`: The original prompt, needed for context in the
+        #   self-healing prompt.
+        logger.debug(f"Delegating repair and validation for model '{response_model.__name__}' to the repair service.")
+        return await repair_and_validate(
+            raw_dict=raw_response_dict,
+            response_model=response_model,
+            llm_client=self,
+            original_messages=messages,
+        )
+
+================================================================================
+--- File: graphiti_ingestion/core/repair_service.py ---
+================================================================================
+
+# graphiti_ingestion/core/repair_service.py
+
+import json
+import logging
+from typing import Any, Callable, Dict
+
+from graphiti_core.llm_client.openai_client import OpenAIClient
+from graphiti_core.prompts.dedupe_edges import EdgeDuplicate
+from graphiti_core.prompts.dedupe_nodes import NodeResolutions
+from graphiti_core.prompts.extract_edges import ExtractedEdges
+from graphiti_core.prompts.extract_nodes import ExtractedEntities, EntitySummary
+from graphiti_core.prompts.invalidate_edges import InvalidatedEdges
+from graphiti_core.prompts.models import Message
+from graphiti_core.prompts.summarize_nodes import Summary
+from pydantic import BaseModel, ValidationError
+
+# Use Python's standard logging module
+logger = logging.getLogger(__name__)
+
+# --- Step 1: Define all individual repair functions ---
+
+def _default_fixer(raw_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """A default fixer that does nothing. Used for schemas with no known common errors."""
+    return raw_dict
+
+def _fix_entity_extraction(raw_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Applies compatibility fixes for the ExtractedEntities schema."""
+    fixed_dict = raw_dict.copy()
+    if "entities" in fixed_dict and "extracted_entities" not in fixed_dict:
+        logger.warning("[Repair] Renaming key 'entities' -> 'extracted_entities'")
+        fixed_dict["extracted_entities"] = fixed_dict.pop("entities")
+
+    if "extracted_entities" in fixed_dict and isinstance(fixed_dict["extracted_entities"], list):
+        for entity in fixed_dict["extracted_entities"]:
+            if isinstance(entity, dict):
+                if "entity_name" in entity and "name" not in entity:
+                    entity["name"] = entity.pop("entity_name")
+                elif "entity_text" in entity and "name" not in entity:
+                    entity["name"] = entity.pop("entity_text")
+    return fixed_dict
+
+def _fix_node_resolution(raw_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Applies compatibility fixes for the NodeResolutions schema."""
+    fixed_dict = raw_dict.copy()
+    if "entity_resolutions" in fixed_dict and isinstance(fixed_dict["entity_resolutions"], list):
+        for resolution in fixed_dict["entity_resolutions"]:
+            if isinstance(resolution, dict) and "duplicates" not in resolution:
+                logger.warning("[Repair] Adding missing 'duplicates' field to a node resolution")
+                resolution["duplicates"] = []
+    return fixed_dict
+
+def _fix_edge_extraction(raw_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Applies compatibility fixes for the ExtractedEdges schema."""
+    fixed_dict = raw_dict.copy()
+    if "facts" in fixed_dict and "edges" not in fixed_dict:
+        logger.warning("[Repair] Renaming key 'facts' -> 'edges'")
+        fixed_dict["edges"] = fixed_dict.pop("facts")
+
+    if "edges" in fixed_dict and isinstance(fixed_dict["edges"], list):
+        for edge in fixed_dict["edges"]:
+            if isinstance(edge, dict):
+                if "subject_id" in edge and "source_entity_id" not in edge:
+                    edge["source_entity_id"] = edge.pop("subject_id")
+                if "object_id" in edge and "target_entity_id" not in edge:
+                    edge["target_entity_id"] = edge.pop("object_id")
+                fact_from_model = edge.pop("fact", None)
+                fact_text_from_model = edge.pop("fact_text", None)
+                if fact_text_from_model and "fact" not in edge:
+                    edge["fact"] = fact_text_from_model
+                if fact_from_model and "relation_type" not in edge:
+                    edge["relation_type"] = fact_from_model
+    return fixed_dict
+
+def _fix_edge_duplicate(raw_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Applies compatibility fixes for the EdgeDuplicate schema."""
+    fixed_dict = raw_dict.copy()
+    if "duplicates" in fixed_dict and "duplicate_facts" not in fixed_dict:
+        logger.warning("[Repair] Renaming key 'duplicates' -> 'duplicate_facts'")
+        fixed_dict["duplicate_facts"] = fixed_dict.pop("duplicates")
+    if "contradictions" in fixed_dict and "contradicted_facts" not in fixed_dict:
+        logger.warning("[Repair] Renaming key 'contradictions' -> 'contradicted_facts'")
+        fixed_dict["contradicted_facts"] = fixed_dict.pop("contradictions")
+    return fixed_dict
+
+# --- Step 2: Create the EXHAUSTIVE, data-driven dispatcher ---
+
+REPAIR_DISPATCHER: Dict[type[BaseModel], Callable[[Dict], Dict]] = {
+    # from extract_nodes.py
+    ExtractedEntities: _fix_entity_extraction,
+    EntitySummary: _default_fixer,
+    
+    # from dedupe_nodes.py
+    NodeResolutions: _fix_node_resolution,
+    
+    # from extract_edges.py
+    ExtractedEdges: _fix_edge_extraction,
+    
+    # from dedupe_edges.py
+    EdgeDuplicate: _fix_edge_duplicate,
+    
+    # from invalidate_edges.py
+    InvalidatedEdges: _default_fixer,
+    
+    # from summarize_nodes.py
+    Summary: _default_fixer,
+}
+
+# --- Step 3: The Self-Healing and Orchestration Logic ---
+
+async def _attempt_llm_self_healing(
+    llm_client: OpenAIClient,
+    original_messages: list[Message],
+    failed_json: str,
+    validation_error: str,
+    response_model: type[BaseModel],
+) -> Dict[str, Any]:
+    model_name = response_model.__name__
+    schema_json = json.dumps(response_model.model_json_schema(), indent=2)
+
+    healing_prompt = f"""
+Your previous attempt to generate a JSON object failed. You must correct your mistake.
+
+Here was the original final instruction:
+---
+{original_messages[-1].content}
+---
+
+Here is the invalid JSON you produced:
+---
+{failed_json}
+---
+
+Here is the Pydantic validation error that occurred:
+---
+{validation_error}
+---
+
+TASK:
+Carefully analyze the validation error and the original instruction.
+Correct the JSON object to make it perfectly valid according to the schema.
+Your response MUST be ONLY the corrected JSON object, with no other text, explanations, or markdown formatting.
+The required schema is:
+---
+{schema_json}
+---
+"""
+    healing_messages = [
+        Message(role="system", content="You are an expert at correcting malformed JSON data to match a given Pydantic schema."),
+        Message(role="user", content=healing_prompt),
+    ]
+
+    logger.warning("Attempting LLM self-healing call...")
+    healed_dict = await llm_client.generate_response(
+        healing_messages,
+        response_model=None,
+    )
+    return healed_dict
+
+async def repair_and_validate(
+    raw_dict: Dict[str, Any],
+    response_model: type[BaseModel],
+    llm_client: OpenAIClient,
+    original_messages: list[Message],
+) -> Dict[str, Any]:
+    model_name = response_model.__name__
+    logger.info(f"Processing payload for schema: '{model_name}'")
+
+    try:
+        response_model.model_validate(raw_dict)
+        logger.info(f"Validation successful for '{model_name}' without any repairs.")
+        return raw_dict
+    except ValidationError:
+        logger.warning(f"Initial validation for '{model_name}' failed. Applying programmatic repairs...")
+        
+        repair_function = REPAIR_DISPATCHER.get(response_model, _default_fixer)
+        programmatically_repaired_dict = repair_function(raw_dict)
+
+        try:
+            validated_model = response_model.model_validate(programmatically_repaired_dict)
+            logger.info(f"Successfully repaired and validated payload for '{model_name}' programmatically.")
+            return validated_model.model_dump(mode="json")
+        except ValidationError as programmatic_error:
+            logger.error(f"Programmatic repair failed for '{model_name}'. Escalating to LLM self-healing.", exc_info=False)
+            logger.debug(f"--- Programmatic Repair Error ---\n{programmatic_error}")
+
+            try:
+                healed_dict = await _attempt_llm_self_healing(
+                    llm_client,
+                    original_messages,
+                    json.dumps(programmatically_repaired_dict, indent=2),
+                    str(programmatic_error),
+                    response_model,
+                )
+                
+                final_validated_model = response_model.model_validate(healed_dict)
+                logger.info(f"LLM self-healing was successful for '{model_name}'!")
+                return final_validated_model.model_dump(mode="json")
+                
+            except Exception as final_error:
+                logger.critical(f"FATAL: LLM self-healing also failed for '{model_name}'.", exc_info=True)
+                logger.debug(f"--- Original dictionary from LLM:\n{raw_dict}")
+                logger.debug(f"--- Programmatically Repaired (and failed) dictionary:\n{programmatically_repaired_dict}")
+                logger.debug(f"--- Final Validation Error after Self-Healing:\n{final_error}")
+                raise final_error
+
+================================================================================
+--- File: graphiti_ingestion/models/episodes.py ---
+================================================================================
+
+from enum import Enum
+from typing import Dict, Union, Optional
+
+from pydantic import BaseModel, Field
+
+
+class EpisodeContentType(str, Enum):
+    """Enumeration for the type of episode content."""
+    TEXT = "text"
+    JSON = "json"
+
+
+class EpisodeRequest(BaseModel):
+    """
+    Defines the structure for an incoming episode ingestion request.
+    """
+    content: Union[str, Dict] = Field(
+        ...,  # ... means this field is required
+        description="The main content of the episode. Can be a string for text episodes or a JSON object for structured data.",
+        examples=[
+            "Kamala Harris was the Attorney General of California.",
+            {"name": "Gavin Newsom", "position": "Governor"},
+        ],
+    )
+    type: EpisodeContentType = Field(
+        ...,
+        description="The type of the content, either 'text' or 'json'.",
+        examples=["text"],
+    )
+    description: str = Field(
+        ...,
+        description="A brief description of the episode's source or context.",
+        examples=["podcast transcript"],
+    )
+
+
+class EpisodeResponse(BaseModel):
+    """
+
+    Defines the response sent back to the client after successfully submitting an episode.
+    """
+    job_id: str = Field(description="The unique identifier for the processing job.")
+    status: str = Field(description="The initial status of the job, typically 'pending'.")
+    message: str = Field(description="A confirmation message.")
+
+
+class JobStatusResponse(BaseModel):
+    """
+    Defines the structure for a job status query response.
+    """
+    job_id: str = Field(description="The unique identifier for the processing job.")
+    status: str = Field(
+        description="The current status of the job (e.g., pending, processing, completed, failed)."
+    )
+    message: Optional[str] = Field(
+        None,
+        description="An optional message, often used to provide details on failures."
+    )
+
+================================================================================
+--- File: tests/test_ingestion_service.py ---
+================================================================================
+
+import asyncio
+import logging
+
+# Ensure all services (Neo4j, vLLM, Triton) are running before executing this script.
+# This script must be run from the root of your project where the .env file is located.
+
+# --- Step 1: Import necessary components ---
+from graphiti_ingestion.services.graphiti_service import (
+    initialize_graphiti_service,
+    get_graphiti_service,
+)
+from graphiti_ingestion.config import get_settings
+
+
+async def main():
+    """
+    A standalone script to test the core functionality of the GraphitiService.
+    """
+    # --- Step 2: Configure logging and load settings ---
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.LOG_LEVEL.upper(),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    logger = logging.getLogger("IntegrationTest")
+    
+    graphiti_service = None
+    try:
+        # --- Step 3: Initialize the service (mimics application startup) ---
+        logger.info("Initializing Graphiti Service for the test...")
+        # This function creates the singleton instance and stores it
+        initialize_graphiti_service()
+        # We retrieve the instance to use it
+        graphiti_service = get_graphiti_service()
+        
+        # This builds the necessary indices and constraints in Neo4j
+        await graphiti_service.startup()
+        logger.info("Service startup complete. Indices should be ready.")
+
+        # --- Step 4: Define dummy episode data ---
+        text_episode = {
+            "content": "The Eiffel Tower, located in Paris, was completed in 1889.",
+            "type": "text",
+            "description": "Historical fact from a test script.",
+        }
+
+        json_episode = {
+            "content": {
+                "landmark": "Eiffel Tower",
+                "city": "Paris",
+                "country": "France",
+                "year_completed": 1889,
+            },
+            "type": "json",
+            "description": "Structured data from a test script.",
+        }
+
+        # --- Step 5: Run the ingestion logic ---
+        logger.info("--- Testing TEXT episode ingestion ---")
+        await graphiti_service.process_and_add_episode(text_episode)
+        logger.info("✅ Text episode ingestion test PASSED.")
+        
+        # Add a small delay if needed, though usually not necessary
+        await asyncio.sleep(1)
+
+        logger.info("--- Testing JSON episode ingestion ---")
+        await graphiti_service.process_and_add_episode(json_episode)
+        logger.info("✅ JSON episode ingestion test PASSED.")
+        
+        logger.info("\nIntegration test completed successfully!")
+        logger.info("Check your Neo4j database to verify that the nodes and relationships for the 'Eiffel Tower' have been created.")
+
+    except Exception as e:
+        logger.critical(f"An error occurred during the integration test: {e}", exc_info=True)
+    finally:
+        # --- Step 6: Cleanly shut down the service ---
+        if graphiti_service:
+            logger.info("Shutting down the Graphiti Service...")
+            await graphiti_service.shutdown()
+            logger.info("Service shutdown complete.")
+
+
+if __name__ == "__main__":
+    # Ensure you have a .env file in the same directory where you run this script
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nTest interrupted by user.")
+
