@@ -1,18 +1,19 @@
 import json
 import logging
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
-from openai import AsyncOpenAI
+from typing import Optional
 
 from graphiti_core import Graphiti
-from graphiti_core.llm_client import LLMConfig, OpenAIClient
-from graphiti_ingestion.core.compatible_openai_client import CompatibleOpenAIClient
-from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
+from graphiti_core.llm_client import LLMConfig
 from graphiti_core.nodes import EpisodeType
 
-# Note: These imports will resolve once we create the corresponding files.
+from graphiti_ingestion.gemini.manager import ComprehensiveManager
+from graphiti_ingestion.gemini.client import ManagedGeminiClient
+from graphiti_ingestion.gemini.reranker import ManagedGeminiReranker
+
 from graphiti_ingestion.config import Settings, get_settings
-from graphiti_ingestion.core.jina_triton_embedder import (
+
+from graphiti_ingestion.embeder.jina_triton_embedder import (
     JinaV3TritonEmbedder,
     JinaV3TritonEmbedderConfig,
 )
@@ -22,52 +23,59 @@ logger = logging.getLogger(__name__)
 
 class GraphitiService:
     """
-    A service class to manage the Graphiti instance and its dependencies.
-
-    This class handles the lifecycle of the Graphiti client, including the
-    configuration and instantiation of the LLM and embedder clients.
+    A service class to manage the Graphiti instance and its dependencies,
+    now powered by Google Gemini and configured via a Pydantic Settings object.
     """
 
     def __init__(self, settings: Settings):
         self.settings = settings
         self.graphiti: Graphiti
         self.jina_embedder: JinaV3TritonEmbedder
+        self.managed_llm_client: ManagedGeminiClient
+        self.managed_reranker: ManagedGeminiReranker
 
-        # 1. Configure the LLM Client (vLLM OpenAI-compatible server)
-        llm_client_vllm = AsyncOpenAI(
-            api_key=self.settings.VLLM_API_KEY,
-            base_url=self.settings.VLLM_BASE_URL,
+        # 1. Initialize the Gemini API Manager using settings from the .env file
+        logger.info("Initializing ComprehensiveManager for Gemini API...")
+        gemini_manager = ComprehensiveManager(
+            api_key_csv_path=self.settings.GEMINI_API_CSV_PATH,
+            model_config_path=self.settings.GEMINI_MODEL_CONFIG,
+            api_key_cooldown_seconds=self.settings.GEMINI_API_KEY_COOLDOWN_SECONDS,
         )
 
-        # The model name here MUST match the model ID served by vLLM
-        vllm_llm_config = LLMConfig(
-            small_model=self.settings.VLLM_MODEL_NAME,
-            model=self.settings.VLLM_MODEL_NAME,
+        # 2. Initialize the Managed Gemini Client (for LLM tasks)
+        logger.info("Initializing ManagedGeminiClient...")
+        self.managed_llm_client = ManagedGeminiClient(
+            manager=gemini_manager,
+            config=LLMConfig(temperature=self.settings.GEMINI_MODEL_TEMPERATURE),
+            global_cooldown_seconds=self.settings.GEMINI_GLOBAL_COOLDOWN_SECONDS,
         )
 
-        # 2. Configure the Embedder Client (Jina Triton Server)
+        # 3. Initialize the Managed Gemini Reranker (for Cross-Encoder tasks)
+        logger.info("Initializing ManagedGeminiReranker...")
+        self.managed_reranker = ManagedGeminiReranker(
+            manager=gemini_manager,
+            config=LLMConfig(model=self.settings.GEMINI_DEFAULT_RERANKER),
+            global_cooldown_seconds=self.settings.GEMINI_GLOBAL_COOLDOWN_SECONDS,
+        )
+
+
+        # 4. Configure the Embedder Client (Jina Triton Server)
         jina_config = JinaV3TritonEmbedderConfig(
             triton_url=self.settings.TRITON_URL
         )
         self.jina_embedder = JinaV3TritonEmbedder(config=jina_config)
 
-        # 3. Initialize Graphiti with all components
+        # 5. Initialize Graphiti with all the new components
         self.graphiti = Graphiti(
             uri=self.settings.NEO4J_URI,
             user=self.settings.NEO4J_USER,
             password=self.settings.NEO4J_PASSWORD,
-            llm_client=CompatibleOpenAIClient(
-                config=vllm_llm_config,
-                client=llm_client_vllm
-            ),
+            llm_client=self.managed_llm_client,
             embedder=self.jina_embedder,
-            # CHANGE: Explicitly configure the cross_encoder to use your vLLM server.
-            cross_encoder=OpenAIRerankerClient(
-                config=vllm_llm_config,  # Reuse the same config
-                client=llm_client_vllm   # Reuse the same client
-            )
+            cross_encoder=self.managed_reranker
         )
-        logger.info("GraphitiService initialized.")
+        logger.info("GraphitiService initialized with Gemini clients.")
+
 
     async def startup(self):
         """
@@ -80,13 +88,24 @@ class GraphitiService:
 
     async def shutdown(self):
         """
-        Closes all connections gracefully.
-        This should be called once when the application shuts down.
+        Closes all connections gracefully, including the Gemini worker threads.
         """
-        logger.info("Closing Graphiti connections...")
-        await self.graphiti.close()
-        await self.jina_embedder.close()
-        logger.info("Graphiti connections closed.")
+        logger.info("Closing Graphiti connections and shutting down services...")
+        if self.graphiti:
+            await self.graphiti.close()
+        if self.jina_embedder:
+            await self.jina_embedder.close()
+        
+        if self.managed_llm_client:
+            self.managed_llm_client.close()
+            logger.info("ManagedGeminiClient worker has been closed.")
+        if self.managed_reranker:
+            self.managed_reranker.close()
+            logger.info("ManagedGeminiReranker worker has been closed.")
+            
+        logger.info("All services and connections are now closed.")
+
+
 
     async def process_and_add_episode(self, episode_data: dict):
         """

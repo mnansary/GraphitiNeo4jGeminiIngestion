@@ -1,3 +1,5 @@
+# graphiti_ingestion/config.py
+
 import logging
 from functools import lru_cache
 
@@ -9,6 +11,7 @@ logger = logging.getLogger(__name__)
 class Settings(BaseSettings):
     """
     Defines the application's configuration settings, loaded from a .env file.
+    Pydantic automatically validates the types and presence of these settings.
     """
     # --- Application Settings ---
     LOG_LEVEL: str = "INFO"
@@ -18,14 +21,18 @@ class Settings(BaseSettings):
     NEO4J_USER: str
     NEO4J_PASSWORD: str
 
-    # --- vLLM (Gemma LLM) Connection ---
-    VLLM_BASE_URL: str
-    VLLM_API_KEY: str
-    # The model name must match the one vLLM is serving
-    VLLM_MODEL_NAME: str
-
     # --- Triton (Jina Embedder) Connection ---
     TRITON_URL: str
+    
+    # --- Gemini API Manager Settings ---
+    GEMINI_API_CSV_PATH: str
+    GEMINI_MODEL_CONFIG: str
+    GEMINI_MODEL_TEMPERATURE: float = 0.3
+    GEMINI_MODEL_SIZE: str = "medium"
+    GEMINI_DEFAULT_RERANKER: str = "gemini-2.5-flash-lite"
+    GEMINI_GLOBAL_COOLDOWN_SECONDS: float = 1.0
+    GEMINI_API_KEY_COOLDOWN_SECONDS: float = 60.0
+
 
     # Pydantic-settings configuration
     model_config = SettingsConfigDict(
@@ -48,10 +55,9 @@ def get_settings() -> Settings:
         settings = Settings()
         return settings
     except Exception as e:
-        logger.error(f"Failed to load settings: {e}")
+        logger.critical(f"FATAL: Failed to load settings from .env file: {e}", exc_info=True)
         raise
-
 
 # You can optionally log the loaded settings on startup for verification
 # settings = get_settings()
-# logger.debug(f"Loaded settings: {settings.model_dump(exclude={'NEO4J_PASSWORD', 'VLLM_API_KEY'})}")
+# logger.debug(f"Loaded settings: {settings.model_dump(exclude={'NEO4J_PASSWORD'})}")

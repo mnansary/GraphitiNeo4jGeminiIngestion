@@ -1,0 +1,181 @@
+# ===================================================================
+# Model Definitions
+# ===================================================================
+# This section acts as a database for all available Gemini models.
+# The manager will use this data to enforce rate limits and check capabilities.
+models:
+  gemini-2.5-pro:
+    rpm: 5
+    tpm: 250000
+    rpd: 100
+    inputs: [ "audio", "image", "video", "text", "pdf" ]
+    outputs: [ "text" ]
+    tokens:
+      input_limit: 1048576
+      output_limit: 65536
+    capabilities:
+      thinking: true
+      function_calling: true
+      code_execution: true
+      structured_outputs: true
+      caching: true
+      search_grounding: true
+
+  gemini-2.5-flash:
+    rpm: 10
+    tpm: 250000
+    rpd: 250
+    inputs: [ "text", "image", "video", "audio" ]
+    outputs: [ "text" ]
+    tokens:
+      input_limit: 1048576
+      output_limit: 65536
+    capabilities:
+      thinking: true
+      function_calling: true
+      code_execution: true
+      structured_outputs: true
+      caching: true
+      search_grounding: true
+
+  gemini-2.5-flash-lite:
+    rpm: 15
+    tpm: 250000
+    rpd: 1000
+    inputs: [ "text", "image", "video", "audio", "pdf" ]
+    outputs: [ "text" ]
+    tokens:
+      input_limit: 1048576
+      output_limit: 65536
+    capabilities:
+      thinking: true
+      function_calling: true
+      code_execution: true
+      structured_outputs: true
+      caching: true
+      search_grounding: true
+      url_context: true
+
+  gemini-2.0-flash:
+    rpm: 15
+    tpm: 1000000
+    rpd: 200
+    inputs: [ "audio", "image", "video", "text" ]
+    outputs: [ "text" ]
+    tokens:
+      input_limit: 1048576
+      output_limit: 8192
+    capabilities:
+      thinking: "experimental" # Use string for non-boolean values
+      function_calling: true
+      code_execution: true
+      structured_outputs: true
+      caching: true
+      live_api: true
+      search: true
+
+  gemini-2.0-flash-lite:
+    rpm: 30
+    tpm: 1000000
+    rpd: 200
+    inputs: [ "audio", "image", "video", "text" ]
+    outputs: [ "text" ]
+    tokens:
+      input_limit: 1048576
+      output_limit: 8192
+    capabilities:
+      function_calling: true
+      structured_outputs: true
+      caching: true
+      batch_api: true
+
+  gemini-2.0-flash-preview-image-generation:
+    rpm: 10
+    tpm: 200000
+    rpd: 100
+    inputs: [ "audio", "image", "video", "text" ]
+    outputs: [ "text", "image" ]
+    tokens:
+      input_limit: 32000
+      output_limit: 8192
+    capabilities:
+      image_generation: true
+      structured_outputs: true
+      caching: true
+
+  gemini-2.5-pro-preview-tts:
+    rpm: 3 # Note: More restricted rate limits for TTS models
+    tpm: 10000
+    rpd: 15
+    inputs: [ "text" ]
+    outputs: [ "audio" ]
+    tokens:
+      input_limit: 8000
+      output_limit: 16000 # Output is measured differently for audio
+    capabilities:
+      audio_generation: true
+
+  gemini-2.5-flash-preview-tts:
+    rpm: 3
+    tpm: 10000
+    rpd: 15
+    inputs: [ "text" ]
+    outputs: [ "audio" ]
+    tokens:
+      input_limit: 8000
+      output_limit: 16000
+    capabilities:
+      audio_generation: true
+  
+  # Live API models have unique rate limits (sessions)
+  gemini-live-2.5-flash-preview:
+    rpm: "3 sessions"
+    tpm: 1000000
+    rpd: null # Not specified
+    inputs: ["audio", "video", "text"]
+    outputs: ["text", "audio"]
+    tokens:
+      input_limit: 1048576
+      output_limit: 8192
+    capabilities:
+      audio_generation: true
+      function_calling: true
+      code_execution: true
+      search: true
+      structured_outputs: true
+
+
+# ===================================================================
+# Task Definitions
+# ===================================================================
+# This section maps a high-level task to a prioritized list of models
+# that can perform it. The manager will try models in this order.
+tasks:
+  TEXT_TO_TEXT:
+    description: "For tasks that primarily involve understanding and generating text, like summarization, Q&A, and creative writing."
+    models:
+      - gemini-2.5-flash        # Best price-performance fallback
+      - gemini-2.0-flash          # High throughput fallback
+      - gemini-2.5-flash-lite     # Most cost-efficient fallback
+      - gemini-2.0-flash-lite     # Final cost-efficient option
+      - gemini-2.5-pro            # Highest quality, try first
+      
+
+  MULTIMODAL_TO_TEXT:
+    description: "For tasks that require understanding images, audio, or video to generate a text response."
+    models:
+      - gemini-2.5-pro          # Best multimodal understanding
+      - gemini-2.5-flash        # Strong alternative
+      - gemini-2.0-flash          # Good fallback with large context
+      - gemini-2.5-flash-lite     # Cost-effective option
+
+  TEXT_TO_AUDIO:
+    description: "For generating speech from text (Text-to-Speech)."
+    models:
+      - gemini-2.5-pro-preview-tts   # Highest quality TTS
+      - gemini-2.5-flash-preview-tts # Price-performant TTS
+
+  IMAGE_GENERATION:
+    description: "For generating images from a text prompt."
+    models:
+      - gemini-2.0-flash-preview-image-generation
