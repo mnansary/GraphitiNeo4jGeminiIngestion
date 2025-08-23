@@ -4,6 +4,7 @@ import logging
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import DirectoryPath
 
 logger = logging.getLogger(__name__)
 
@@ -15,13 +16,14 @@ class Settings(BaseSettings):
     """
     # --- Application Settings ---
     LOG_LEVEL: str = "INFO"
+    JOB_QUEUE_PATH: DirectoryPath # Ensures the path exists
 
     # --- Neo4j Connection ---
     NEO4J_URI: str
     NEO4J_USER: str
     NEO4J_PASSWORD: str
 
-    # --- Triton (Jina Embedder) Connection ---
+    # --- Triton (Jina Embedder) Connection ---d
     TRITON_URL: str
     
     # --- Gemini API Manager Settings ---

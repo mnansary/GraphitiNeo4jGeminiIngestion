@@ -1,19 +1,22 @@
+# graphiti_ingestion/api/episodes.py
+
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, status
 
-# The imports now correctly reference the 'graphiti_ingestion' package.
-# These files will be created in the upcoming steps.
-from graphiti_ingestion.models.episodes import (
+from ..models.episodes import (
     EpisodeRequest,
     EpisodeResponse,
     JobStatusResponse,
 )
-from graphiti_ingestion.services.task_queue import TaskQueue, get_task_queue
+from ..services.job_manager import JobManager, get_job_manager
 
 router = APIRouter(
     prefix="/episodes",
     tags=["Episodes"],
-    responses={404: {"description": "Not found"}},
+    responses={
+        404: {"description": "Job not found"},
+        500: {"description": "Internal server error"}
+    },
 )
 
 
@@ -22,33 +25,38 @@ router = APIRouter(
     response_model=EpisodeResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Submit an episode for ingestion",
-    description="Accepts an episode's content, type, and description, then adds it to a background processing queue.",
+    description=(
+        "Accepts episode content, type, and description. The request is "
+        "persistently saved to a file-based queue for background processing. "
+        "A unique job ID is returned immediately to the client for status tracking."
+    ),
 )
 async def submit_episode(
     episode_request: EpisodeRequest,
-    task_queue: TaskQueue = Depends(get_task_queue),
-):
+    job_manager: JobManager = Depends(get_job_manager),
+) -> EpisodeResponse:
     """
-    Submits a new episode to the ingestion queue.
+    Submits a new episode to the persistent ingestion queue.
 
-    This endpoint is non-blocking. It generates a unique job ID for the request,
-    places it in the queue for background processing, and immediately returns the
-    job ID to the client.
+    This endpoint is non-blocking. It generates a unique job ID, saves the
+    request payload as a JSON file in the 'pending' queue directory, and
+    immediately returns the job ID.
 
     Args:
-        episode_request: The episode data payload from the client.
-        task_queue: The dependency-injected task queue service.
+        episode_request: The Pydantic model containing the episode data from the client.
+        job_manager: The dependency-injected job manager service that handles
+                     the file-based queue.
 
     Returns:
-        An EpisodeResponse containing the job_id and initial status.
+        An EpisodeResponse containing the generated job_id and initial status.
     """
     job_id = str(uuid.uuid4())
-    await task_queue.submit_job(job_id, episode_request.model_dump())
+    await job_manager.submit_job(job_id, episode_request.model_dump())
 
     return EpisodeResponse(
         job_id=job_id,
         status="pending",
-        message="Episode accepted for processing.",
+        message="Episode accepted for processing and saved to disk.",
     )
 
 
@@ -56,26 +64,30 @@ async def submit_episode(
     "/status/{job_id}",
     response_model=JobStatusResponse,
     summary="Check the status of an ingestion job",
-    description="Retrieves the current processing status of an episode submitted previously.",
+    description="Retrieves the current processing status of a previously submitted episode by querying the file-based queue.",
 )
 async def get_job_status(
     job_id: str,
-    task_queue: TaskQueue = Depends(get_task_queue),
-):
+    job_manager: JobManager = Depends(get_job_manager),
+) -> JobStatusResponse:
     """
     Retrieves the status of a specific ingestion job by its ID.
 
+    The job manager locates the job's status file across all state directories
+    (pending, processing, completed, failed) to provide the most current information.
+
     Args:
-        job_id: The unique identifier for the job.
-        task_queue: The dependency-injected task queue service.
+        job_id: The unique identifier for the job, provided upon submission.
+        job_manager: The dependency-injected job manager service.
 
     Returns:
-        The current status of the job (pending, processing, completed, or failed).
-    
+        The current status of the job, including a descriptive message.
+
     Raises:
-        HTTPException: If the job_id is not found.
+        HTTPException (404 Not Found): If a job with the specified ID cannot be found.
     """
-    status_info = await task_queue.get_job_status(job_id)
+
+    status_info = await job_manager.get_job_status(job_id)
 
     if status_info is None:
         raise HTTPException(
