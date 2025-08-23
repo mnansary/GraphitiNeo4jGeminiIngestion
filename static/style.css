@@ -1,0 +1,291 @@
+/* static/styles.css */
+
+/* --- Global Styles & Variables --- */
+:root {
+    --bg-color: #1a1d24;
+    --primary-surface: #2c313a;
+    --secondary-surface: #22262e;
+    --border-color: #444a58;
+    --primary-text: #e1e1e1;
+    --secondary-text: #a0a8b4;
+    --font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    --font-family-mono: 'Consolas', 'Courier New', monospace;
+
+    --color-pending: #3b82f6; /* Blue */
+    --color-processing: #f59e0b; /* Amber */
+    --color-completed: #22c55e; /* Green */
+    --color-failed: #ef4444; /* Red */
+    --color-connected: #22c55e;
+    --color-disconnected: #ef4444;
+}
+
+body {
+    background-color: var(--bg-color);
+    color: var(--primary-text);
+    font-family: var(--font-family);
+    margin: 0;
+    padding: 1rem;
+    overflow-x: hidden;
+}
+
+/* --- Header --- */
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.5rem 1.5rem;
+    background-color: var(--secondary-surface);
+    border-bottom: 1px solid var(--border-color);
+    border-radius: 8px;
+    margin-bottom: 1.5rem;
+}
+
+header h1 {
+    font-size: 1.5rem;
+    margin: 0;
+}
+
+.connection-status {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+}
+
+.status-light {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background-color: var(--color-processing); /* Default yellow */
+    transition: background-color 0.3s ease;
+}
+
+.status-light.connected {
+    background-color: var(--color-connected);
+}
+
+.status-light.disconnected {
+    background-color: var(--color-disconnected);
+}
+
+/* --- Main Layout --- */
+.dashboard-container {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+.job-columns {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1.5rem;
+}
+
+.job-column {
+    background-color: var(--secondary-surface);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    padding: 1rem;
+}
+
+.job-column h2 {
+    margin-top: 0;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border-color);
+    font-size: 1.1rem;
+    color: var(--primary-text);
+}
+
+#pending-column h2 { border-color: var(--color-pending); }
+#processing-column h2 { border-color: var(--color-processing); }
+#completed-column h2 { border-color: var(--color-completed); }
+#failed-column h2 { border-color: var(--color-failed); }
+
+.job-list {
+    flex-grow: 1;
+    overflow-y: auto;
+    height: 40vh; /* Adjust height as needed */
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding-right: 0.5rem; /* For scrollbar */
+}
+
+/* --- Job Card Styling --- */
+.job-card {
+    background-color: var(--primary-surface);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    border-left: 5px solid var(--border-color);
+    cursor: pointer;
+    transition: transform 0.2s ease, background-color 0.2s ease;
+    word-wrap: break-word;
+}
+
+.job-card:hover {
+    transform: translateY(-2px);
+    background-color: #383e4a;
+}
+
+.job-card .job-id {
+    font-family: var(--font-family-mono);
+    font-weight: bold;
+    font-size: 0.9rem;
+    margin-bottom: 0.25rem;
+}
+
+.job-card .job-description {
+    font-size: 0.85rem;
+    color: var(--secondary-text);
+    margin-bottom: 0.5rem;
+}
+
+.job-card .job-timestamp {
+    font-size: 0.75rem;
+    color: var(--secondary-text);
+    opacity: 0.7;
+}
+
+/* Card border colors based on status */
+.job-card.pending { border-color: var(--color-pending); }
+.job-card.processing { border-color: var(--color-processing); }
+.job-card.completed { border-color: var(--color-completed); }
+.job-card.failed { border-color: var(--color-failed); }
+
+
+/* --- Log Container --- */
+.log-container {
+    background-color: var(--secondary-surface);
+    border-radius: 8px;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+}
+
+.log-container h2 {
+    margin-top: 0;
+    font-size: 1.1rem;
+}
+
+.log-feed {
+    background-color: #111317; /* Darker for contrast */
+    border-radius: 6px;
+    padding: 1rem;
+    height: 45vh; /* Adjust height as needed */
+    overflow-y: auto;
+    font-family: var(--font-family-mono);
+    font-size: 0.85rem;
+    white-space: pre-wrap; /* Wrap long lines */
+    color: var(--secondary-text);
+}
+
+.log-line {
+    line-height: 1.5;
+}
+
+.log-line.INFO { color: #a0a8b4; }
+.log-line.WARNING { color: #facc15; } /* Yellow */
+.log-line.ERROR, .log-line.CRITICAL { color: #f87171; } /* Light Red */
+
+
+/* --- Modal for Job Details --- */
+.modal {
+    display: none; /* Hidden by default */
+    position: fixed;
+    z-index: 1000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    overflow: auto;
+    background-color: rgba(0, 0, 0, 0.7);
+    animation: fadeIn 0.3s;
+}
+
+.modal-content {
+    background-color: var(--primary-surface);
+    margin: 10% auto;
+    padding: 2rem;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    width: 60%;
+    max-width: 800px;
+    position: relative;
+    box-shadow: 0 5px 15px rgba(0,0,0,0.5);
+    animation: slideIn 0.4s;
+}
+
+.close-button {
+    color: var(--secondary-text);
+    position: absolute;
+    top: 1rem;
+    right: 1.5rem;
+    font-size: 2rem;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+.close-button:hover {
+    color: var(--primary-text);
+}
+
+#modal-details-content pre {
+    background-color: #111317;
+    padding: 1rem;
+    border-radius: 6px;
+    max-height: 50vh;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-size: 0.9rem;
+}
+
+/* --- Scrollbar Styling --- */
+::-webkit-scrollbar {
+    width: 8px;
+}
+::-webkit-scrollbar-track {
+    background: var(--secondary-surface);
+    border-radius: 10px;
+}
+::-webkit-scrollbar-thumb {
+    background: #555c6b;
+    border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: #71798a;
+}
+
+/* --- Animations --- */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideIn {
+  from { transform: translateY(-50px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+/* --- Responsive Design --- */
+@media (max-width: 1200px) {
+    .job-columns {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+@media (max-width: 768px) {
+    .job-columns {
+        grid-template-columns: 1fr;
+    }
+    header {
+        flex-direction: column;
+        gap: 0.75rem;
+        align-items: flex-start;
+    }
+    .modal-content {
+        width: 90%;
+        margin: 5% auto;
+    }
+}

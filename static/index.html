@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Graphiti Ingestion Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <!-- Header Section -->
+    <header>
+        <h1>Graphiti Ingestion Service Dashboard</h1>
+        <div class="connection-status" id="connection-status">
+            <div class="status-light" id="status-light"></div>
+            <span id="status-text">Connecting...</span>
+        </div>
+    </header>
+
+    <!-- Main Dashboard Content -->
+    <main class="dashboard-container">
+        <!-- Job Status Columns -->
+        <div class="job-columns">
+            <div class="job-column" id="pending-column">
+                <h2>Pending (<span id="pending-count">0</span>)</h2>
+                <div class="job-list" id="pending-list"></div>
+            </div>
+            <div class="job-column" id="processing-column">
+                <h2>Processing (<span id="processing-count">0</span>)</h2>
+                <div class="job-list" id="processing-list"></div>
+            </div>
+            <div class="job-column" id="completed-column">
+                <h2>Completed (<span id="completed-count">0</span>)</h2>
+                <div class="job-list" id="completed-list"></div>
+            </div>
+            <div class="job-column" id="failed-column">
+                <h2>Failed (<span id="failed-count">0</span>)</h2>
+                <div class="job-list" id="failed-list"></div>
+            </div>
+        </div>
+
+        <!-- Live Log Feed Section -->
+        <div class="log-container">
+            <h2>Live Application Logs</h2>
+            <div class="log-feed" id="log-feed">
+                <!-- Log lines will be inserted here by JavaScript -->
+            </div>
+        </div>
+    </main>
+
+    <!-- Job Details Modal (Initially Hidden) -->
+    <div id="job-details-modal" class="modal">
+        <div class="modal-content">
+            <span class="close-button" id="close-modal-button">&times;</span>
+            <h2 id="modal-job-id">Job Details</h2>
+            <div id="modal-details-content">
+                <!-- Job details will be dynamically inserted here -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Link to the JavaScript file -->
+    <script src="/static/dashboard.js"></script>
+</body>
+</html>
