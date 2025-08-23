@@ -4,7 +4,10 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone, fromisoformat
+# --- CORRECTED IMPORT ---
+# We only import the main classes/modules we need.
+from datetime import datetime, timezone
+# --- END CORRECTION ---
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -58,9 +61,7 @@ class JobManager:
         }
 
         loop = asyncio.get_running_loop()
-        # Write the main job data file
         await loop.run_in_executor(None, job_path.write_text, json.dumps(data, indent=2, ensure_ascii=False))
-        # Write the accompanying status file
         await loop.run_in_executor(None, status_path.write_text, json.dumps(status_info, indent=2, ensure_ascii=False))
         logger.info(f"Submitted job {job_id} to the pending queue.")
 
@@ -76,12 +77,10 @@ class JobManager:
                 return json.loads(content)
         return None
 
-    # --- NEW METHOD FOR THE DASHBOARD ---
     async def get_all_job_statuses(self) -> List[Dict[str, Any]]:
         """
         Scans all status directories, reads all status files, and returns a
-        comprehensive list of all jobs and their current states. This is the
-        primary data source for the monitoring dashboard.
+        comprehensive list of all jobs and their current states.
         """
         all_jobs = []
         loop = asyncio.get_running_loop()
@@ -93,18 +92,19 @@ class JobManager:
                     content = await loop.run_in_executor(None, status_file.read_text)
                     job_data = json.loads(content)
 
-                    # For completed jobs, calculate the processing time
                     if job_data.get("status") == JobStatus.COMPLETED:
-                        submitted = fromisoformat(job_data["submitted_at"])
-                        completed = fromisoformat(job_data["last_updated"])
+                        # --- CORRECTED METHOD CALL ---
+                        # We call fromisoformat() on the datetime class itself.
+                        submitted = datetime.fromisoformat(job_data["submitted_at"])
+                        completed = datetime.fromisoformat(job_data["last_updated"])
+                        # --- END CORRECTION ---
                         duration = (completed - submitted).total_seconds()
                         job_data["processing_time_seconds"] = round(duration, 2)
 
                     all_jobs.append(job_data)
-                except (json.JSONDecodeError, KeyError) as e:
+                except (json.JSONDecodeError, KeyError, ValueError) as e:
                     logger.error(f"Could not parse status file {status_file}: {e}")
 
-        # Sort jobs by submission time to have a consistent order
         all_jobs.sort(key=lambda j: j.get("submitted_at", ""), reverse=True)
         return all_jobs
 
@@ -114,8 +114,6 @@ class JobManager:
         'processing' to claim it, and returns its data for the worker.
         """
         pending_path = self.paths[JobStatus.PENDING]
-
-        # Use os.path.getctime to reliably find the oldest file
         pending_job_files = [f for f in pending_path.glob("*.json") if ".status" not in f.name]
         if not pending_job_files:
             return None
@@ -127,28 +125,22 @@ class JobManager:
         processing_job_path, processing_status_path = self._get_job_paths(job_id, JobStatus.PROCESSING)
         pending_status_path = pending_path / f"{job_id}.status.json"
 
-        # Atomically move files to claim the job for processing
         try:
             await loop.run_in_executor(None, lambda: oldest_job_path.rename(processing_job_path))
             if pending_status_path.exists():
                 await loop.run_in_executor(None, lambda: pending_status_path.rename(processing_status_path))
         except FileNotFoundError:
-             # This can happen in a race condition if another worker grabs the job first. It's safe to ignore.
             logger.warning(f"Job {job_id} was moved by another process before this worker could claim it.")
             return None
 
-
-        # Update status to 'processing' before returning
         await self.update_job_status(job_id, JobStatus.PROCESSING, "Worker started processing job.")
-
         content = await loop.run_in_executor(None, processing_job_path.read_text)
         logger.info(f"Moved job {job_id} to processing.")
         return job_id, json.loads(content)
 
     async def update_job_status(self, job_id: str, new_status: str, message: Optional[str] = None):
         """
-        Updates a job's status by moving its files to the corresponding directory
-        and updating the content of its status file.
+        Updates a job's status by moving its files and updating its status file content.
         """
         current_status_info = await self.get_job_status(job_id)
         if not current_status_info:
@@ -156,8 +148,6 @@ class JobManager:
             return
 
         current_status = current_status_info["status"]
-
-        # Only perform file moves if the directory-level status has changed
         if current_status != new_status:
             current_job_path, current_status_path = self._get_job_paths(job_id, current_status)
             new_job_path, new_status_path = self._get_job_paths(job_id, new_status)
@@ -168,7 +158,6 @@ class JobManager:
             if current_status_path.exists():
                 await loop.run_in_executor(None, lambda: current_status_path.rename(new_status_path))
 
-        # Now, update the content of the (potentially moved) status file
         _, final_status_path = self._get_job_paths(job_id, new_status)
         current_status_info["status"] = new_status
         current_status_info["last_updated"] = datetime.now(timezone.utc).isoformat()
@@ -189,6 +178,5 @@ def get_job_manager() -> JobManager:
     if _job_manager_instance is None:
         logger.info("Creating singleton instance of JobManager.")
         settings = get_settings()
-        # The path is now validated by Pydantic's DirectoryPath type
         _job_manager_instance = JobManager(base_path=settings.JOB_QUEUE_PATH)
     return _job_manager_instance

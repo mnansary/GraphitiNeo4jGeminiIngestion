@@ -1,80 +1,106 @@
-# tests/test_api_client.py
+# tests/test_api_ingestion.py
+
 import asyncio
 import httpx
 import logging
+from typing import Dict
 
-# Configure basic logging
+# --- Configuration ---
 logging.basicConfig(
     level="INFO",
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("ApiClientTest")
+logger = logging.getLogger("ApiJobSubmitter")
 
+# The API URL must point to your public Nginx server and the correct location block.
 API_BASE_URL = "http://localhost:6000"
 
+# --- Test Data Payloads ---
 text_episode = {
-    "content": "The Eiffel Tower, located in Paris, was completed in 1889.",
+    "content": "The Statue of Liberty was a gift to the United States from the people of France in 1886. It was designed by French sculptor Frédéric Auguste Bartholdi.",
     "type": "text",
-    "description": "Historical fact from a test client script.",
+    "description": "API Test: Historical fact about the Statue of Liberty.",
 }
 
 json_episode = {
     "content": {
-        "landmark": "Eiffel Tower",
-        "city": "Paris",
-        "country": "France",
-        "year_completed": 1889,
+        "event": "Completion of the Statue of Liberty",
+        "location": "New York Harbor, USA",
+        "origin_country": "France",
+        "year": 1886,
+        "key_figures": ["Frédéric Auguste Bartholdi", "Gustave Eiffel"],
     },
     "type": "json",
-    "description": "Structured data from a test client script.",
+    "description": "API Test: Structured data about the Statue of Liberty.",
 }
 
-async def test_episode_ingestion(client: httpx.AsyncClient, episode_data: dict, episode_name: str):
-    """Helper function to submit an episode and poll for its completion status."""
-    logger.info(f"--- Submitting {episode_name} episode ---")
-    
-    # 1. Submit the job
-    response = await client.post(f"{API_BASE_URL}/episodes/", json=episode_data)
-    
-    if response.status_code != 202:
-        logger.error(f"Failed to submit job. Status: {response.status_code}, Body: {response.text}")
-        return
 
-    response_data = response.json()
-    job_id = response_data.get("job_id")
-    logger.info(f"Successfully submitted job with ID: {job_id}")
+async def submit_ingestion_job(
+    client: httpx.AsyncClient, episode_data: Dict, test_name: str
+):
+    """
+    Handles submitting a single ingestion job to the API endpoint.
+    This function does NOT wait for the job to complete.
+    """
+    logger.info(f"--- [SUBMITTING] Job: '{test_name}' ---")
 
-    # 2. Poll for status until completed or failed
-    while True:
-        await asyncio.sleep(5)  # Wait 5 seconds between checks
-        logger.info(f"Polling status for job {job_id}...")
-        status_response = await client.get(f"{API_BASE_URL}/episodes/status/{job_id}")
-        
-        if status_response.status_code != 200:
-            logger.error(f"Failed to get job status. Status: {status_response.status_code}")
-            break
-        
-        status_data = status_response.json()
-        current_status = status_data.get("status")
-        message = status_data.get("message")
-        logger.info(f"Current status for {job_id}: {current_status} - {message}")
+    try:
+        # Submit the job to the ingestion service
+        submit_response = await client.post(
+            f"{API_BASE_URL}/episodes/", json=episode_data, timeout=10.0
+        )
 
-        if current_status in ["completed", "failed"]:
-            if current_status == "completed":
-                logger.info(f"✅ {episode_name} episode ingestion test PASSED.")
-            else:
-                logger.error(f"❌ {episode_name} episode ingestion test FAILED.")
-            break
+        # Check if the submission was accepted by the server
+        if submit_response.status_code == 202:
+            response_data = submit_response.json()
+            job_id = response_data.get("job_id")
+            logger.info(f"✅ [{test_name}] SUBMITTED SUCCESSFULLY. Job ID: {job_id}")
+            logger.info(f"   ---> Monitor the dashboard for its progress from 'pending' to 'completed'.")
+        else:
+            logger.error(
+                f"❌ [{test_name}] FAILED to submit job. "
+                f"Status: {submit_response.status_code}, Body: {submit_response.text}"
+            )
+
+    except httpx.RequestError as e:
+        logger.error(f"❌ [{test_name}] FAILED during submission. Connection error: {e}")
+
 
 async def main():
-    """Main function to run the API tests."""
-    async with httpx.AsyncClient() as client:
-        await test_episode_ingestion(client, text_episode, "TEXT")
-        await test_episode_ingestion(client, json_episode, "JSON")
-    
-    logger.info("\nAPI client test completed successfully!")
-    logger.info("Check your Neo4j database and the API server logs for details.")
+    """
+    Main function to orchestrate and run all API job submissions concurrently.
+    """
+    print("\n" + "="*80)
+    print("🚀 STARTING INGESTION JOB SUBMITTER 🚀")
+    print("="*80)
+    print("Instructions:")
+    print("1. This script will fire multiple jobs at the API endpoint.")
+    print("2. It does NOT wait for them to complete.")
+    print(f"3. Your job is to watch the dashboard at https://114.130.116.79/ingestion/dashboard/ in real-time!")
+    print("   You should see jobs instantly appear in the 'Pending' column.")
+    print("-" * 80)
+
+    # The verify=False is needed for self-signed SSL certificates.
+    async with httpx.AsyncClient(verify=False) as client:
+        # Create a list of submission tasks to run concurrently
+        tasks = [
+            submit_ingestion_job(client, text_episode, "Text Episode Ingestion"),
+            submit_ingestion_job(client, json_episode, "JSON Episode Ingestion"),
+            # You can add more jobs here to test higher loads
+            # submit_ingestion_job(client, text_episode, "Text Episode Ingestion #2"),
+        ]
+        await asyncio.gather(*tasks)
+
+    print("\n" + "="*80)
+    print("✅ SUBMISSION COMPLETE ✅")
+    print("="*80)
+    print("All jobs have been sent to the server. Please check your dashboard to monitor their progress.")
+    print("")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nJob submission interrupted by user.")

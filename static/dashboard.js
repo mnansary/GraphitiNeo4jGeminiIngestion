@@ -31,14 +31,18 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- WebSocket Connection Handling ---
     function connectWebSocket() {
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${wsProtocol}//${window.location.host}/dashboard/ws/dashboard`;
+        
+        // --- THIS IS THE CRITICAL CHANGE ---
+        // Dynamically construct the path to include the Nginx location block
+        const wsUrl = `${wsProtocol}//${window.location.host}/ingestion/dashboard/ws/dashboard`;      
+        // --- END OF CHANGE ---
 
+        console.log(`Attempting to connect to WebSocket at: ${wsUrl}`);
         socket = new WebSocket(wsUrl);
 
         socket.onopen = () => {
             console.log('WebSocket connection established.');
             updateConnectionStatus(true);
-            // Request initial data dump upon connection
             socket.send(JSON.stringify({ action: 'get_all_jobs' }));
         };
 
@@ -50,7 +54,7 @@ document.addEventListener('DOMContentLoaded', () => {
         socket.onclose = () => {
             console.log('WebSocket connection closed. Attempting to reconnect in 3 seconds...');
             updateConnectionStatus(false);
-            setTimeout(connectWebSocket, 3000); // Retry connection after 3 seconds
+            setTimeout(connectWebSocket, 3000);
         };
 
         socket.onerror = (error) => {

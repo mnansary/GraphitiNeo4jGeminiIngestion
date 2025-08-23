@@ -15,7 +15,7 @@ WorkingDirectory=/home/vpa/KnowledgeGraphNeo4j
 # --- Execution Command ---
 # This command uses the specific Python from your 'base' conda environment
 # to run the uvicorn module, starting your FastAPI app on port 6000.
-ExecStart=/home/vpa/miniconda3/bin/python -m uvicorn main:app --host 0.0.0.0 --port 6000
+ExecStart=/home/vpa/miniconda3/bin/python -m uvicorn main:app --host 127.0.0.1 --port 6000 --forwarded-allow-ips='*'
 
 # --- Environment Configuration ---
 # This line tells systemd to load all variables from your .env file.
