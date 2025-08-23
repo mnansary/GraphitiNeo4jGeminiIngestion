@@ -4,14 +4,13 @@ import asyncio
 import json
 import logging
 import os
-# --- CORRECTED IMPORT ---
-# We only import the main classes/modules we need.
 from datetime import datetime, timezone
-# --- END CORRECTION ---
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import get_settings
+# ---> ADD THIS IMPORT to get access to the websocket manager
+from ..api.dashboard_websockets import websocket_manager
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +47,16 @@ class JobManager:
         dir_path = self.paths[status]
         return dir_path / f"{job_id}.json", dir_path / f"{job_id}.status.json"
 
+    # ---> NEW HELPER FUNCTION TO BROADCAST UPDATES ---
+    def _broadcast_job_update(self, job_data: Dict[str, Any]):
+        """Helper to send a job update to all connected dashboard clients."""
+        message = {"type": "job_update", "payload": job_data}
+        # Use the threadsafe method to call the async broadcast from this sync context
+        websocket_manager.broadcast_threadsafe(json.dumps(message))
+        logger.debug(f"Broadcasted job update for {job_data.get('job_id')}")
+
     async def submit_job(self, job_id: str, data: Dict[str, Any]):
-        """Saves a new job to the 'pending' directory."""
+        """Saves a new job to the 'pending' directory and notifies the dashboard."""
         job_path, status_path = self._get_job_paths(job_id, JobStatus.PENDING)
 
         status_info = {
@@ -65,10 +72,11 @@ class JobManager:
         await loop.run_in_executor(None, status_path.write_text, json.dumps(status_info, indent=2, ensure_ascii=False))
         logger.info(f"Submitted job {job_id} to the pending queue.")
 
+        # ---> ADDED: Notify the dashboard of the new pending job
+        self._broadcast_job_update(status_info)
+
     async def get_job_status(self, job_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Finds and reads the status file for a single job by its ID across all directories.
-        """
+        """Finds and reads the status file for a single job by its ID."""
         for status in self.paths.keys():
             _, status_path = self._get_job_paths(job_id, status)
             if status_path.exists():
@@ -78,10 +86,7 @@ class JobManager:
         return None
 
     async def get_all_job_statuses(self) -> List[Dict[str, Any]]:
-        """
-        Scans all status directories, reads all status files, and returns a
-        comprehensive list of all jobs and their current states.
-        """
+        """Scans all status directories for the dashboard's initial load."""
         all_jobs = []
         loop = asyncio.get_running_loop()
 
@@ -93,11 +98,8 @@ class JobManager:
                     job_data = json.loads(content)
 
                     if job_data.get("status") == JobStatus.COMPLETED:
-                        # --- CORRECTED METHOD CALL ---
-                        # We call fromisoformat() on the datetime class itself.
                         submitted = datetime.fromisoformat(job_data["submitted_at"])
                         completed = datetime.fromisoformat(job_data["last_updated"])
-                        # --- END CORRECTION ---
                         duration = (completed - submitted).total_seconds()
                         job_data["processing_time_seconds"] = round(duration, 2)
 
@@ -109,10 +111,7 @@ class JobManager:
         return all_jobs
 
     async def get_next_job(self) -> Optional[Tuple[str, Dict[str, Any]]]:
-        """
-        Finds the oldest pending job based on file creation time, moves it to
-        'processing' to claim it, and returns its data for the worker.
-        """
+        """Finds and claims the oldest pending job for the worker."""
         pending_path = self.paths[JobStatus.PENDING]
         pending_job_files = [f for f in pending_path.glob("*.json") if ".status" not in f.name]
         if not pending_job_files:
@@ -139,9 +138,7 @@ class JobManager:
         return job_id, json.loads(content)
 
     async def update_job_status(self, job_id: str, new_status: str, message: Optional[str] = None):
-        """
-        Updates a job's status by moving its files and updating its status file content.
-        """
+        """Updates a job's status, moves its files, and notifies the dashboard."""
         current_status_info = await self.get_job_status(job_id)
         if not current_status_info:
             logger.error(f"Cannot update status for non-existent job {job_id}.")
@@ -151,7 +148,7 @@ class JobManager:
         if current_status != new_status:
             current_job_path, current_status_path = self._get_job_paths(job_id, current_status)
             new_job_path, new_status_path = self._get_job_paths(job_id, new_status)
-            
+
             loop = asyncio.get_running_loop()
             if current_job_path.exists():
                 await loop.run_in_executor(None, lambda: current_job_path.rename(new_job_path))
@@ -164,9 +161,19 @@ class JobManager:
         if message:
             current_status_info["message"] = message
 
+        # ---> ADDED: Calculate processing time on completion
+        if new_status == JobStatus.COMPLETED:
+            submitted = datetime.fromisoformat(current_status_info["submitted_at"])
+            completed = datetime.fromisoformat(current_status_info["last_updated"])
+            duration = (completed - submitted).total_seconds()
+            current_status_info["processing_time_seconds"] = round(duration, 2)
+
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, final_status_path.write_text, json.dumps(current_status_info, indent=2, ensure_ascii=False))
         logger.info(f"Updated job {job_id} to status '{new_status}'.")
+
+        # ---> ADDED: Notify the dashboard of the status change
+        self._broadcast_job_update(current_status_info)
 
 
 # --- Dependency Injection Singleton ---

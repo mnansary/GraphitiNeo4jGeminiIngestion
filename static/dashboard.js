@@ -24,18 +24,14 @@ document.addEventListener('DOMContentLoaded', () => {
         failed: document.getElementById('failed-count'),
     };
 
-    // Store all job data in memory for quick access
+    // Store all job data in memory for quick access and real-time updates
     let allJobsData = {};
     let socket;
 
     // --- WebSocket Connection Handling ---
     function connectWebSocket() {
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        
-        // --- THIS IS THE CRITICAL CHANGE ---
-        // Dynamically construct the path to include the Nginx location block
-        const wsUrl = `${wsProtocol}//${window.location.host}/ingestion/dashboard/ws/dashboard`;      
-        // --- END OF CHANGE ---
+        const wsUrl = `${wsProtocol}//${window.location.host}/ingestion/dashboard/ws/dashboard`;
 
         console.log(`Attempting to connect to WebSocket at: ${wsUrl}`);
         socket = new WebSocket(wsUrl);
@@ -43,6 +39,7 @@ document.addEventListener('DOMContentLoaded', () => {
         socket.onopen = () => {
             console.log('WebSocket connection established.');
             updateConnectionStatus(true);
+            // Request the initial full list of jobs upon connecting
             socket.send(JSON.stringify({ action: 'get_all_jobs' }));
         };
 
@@ -74,7 +71,6 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-
     // --- WebSocket Message Processing ---
     function handleWebSocketMessage(data) {
         switch (data.type) {
@@ -82,36 +78,43 @@ document.addEventListener('DOMContentLoaded', () => {
                 appendLogLine(data.payload);
                 break;
             case 'all_jobs':
-                // This is a full state update, so clear and re-render everything
-                allJobsData = {};
+                // Received the initial snapshot of all jobs
+                allJobsData = {}; // Clear existing data
                 data.payload.forEach(job => {
                     allJobsData[job.job_id] = job;
                 });
                 renderAllJobs();
                 break;
-            // Future enhancement: Handle single job updates for efficiency
-            // case 'job_update':
-            //     allJobsData[data.payload.job_id] = data.payload;
-            //     renderAllJobs(); // Simple re-render for now
-            //     break;
+            
+            // ---> THIS IS THE NEW, REAL-TIME LOGIC <---
+            case 'job_update':
+                // A single job has been submitted or has changed state.
+                const updatedJob = data.payload;
+                console.log('Received job_update:', updatedJob);
+
+                // Update the job in our local data store.
+                allJobsData[updatedJob.job_id] = updatedJob;
+                
+                // Re-render the entire board. This is the simplest way
+                // to ensure the job card moves to the correct column.
+                renderAllJobs();
+                break;
         }
     }
 
-
     // --- UI Rendering ---
     function renderAllJobs() {
-        // Clear all current lists
+        // Clear all current lists to prevent duplicates
         Object.values(jobLists).forEach(list => list.innerHTML = '');
-        Object.values(jobCounts).forEach(countEl => countEl.textContent = '0');
-
+        
         const counts = { pending: 0, processing: 0, completed: 0, failed: 0 };
 
-        // Sort jobs by submission date (newest first)
+        // Sort jobs by submission date (newest first) for a consistent order
         const sortedJobs = Object.values(allJobsData).sort(
             (a, b) => new Date(b.submitted_at) - new Date(a.submitted_at)
         );
 
-        // Populate lists with sorted jobs
+        // Create and append job cards to the correct columns
         sortedJobs.forEach(job => {
             const status = job.status;
             if (jobLists[status]) {
@@ -121,7 +124,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
 
-        // Update counts in the UI
+        // Update the count display in each column header
         Object.keys(counts).forEach(status => {
             jobCounts[status].textContent = counts[status];
         });
@@ -132,12 +135,16 @@ document.addEventListener('DOMContentLoaded', () => {
         card.className = `job-card ${job.status}`;
         card.dataset.jobId = job.job_id;
 
-        const description = job.message || 'No description provided.';
+        // Use a more descriptive text for the card
+        const descriptionText = (job.status === 'completed' && job.processing_time_seconds)
+            ? `Completed in ${job.processing_time_seconds}s`
+            : job.message.substring(0, 60);
+        
         const submittedTime = new Date(job.submitted_at).toLocaleString();
 
         card.innerHTML = `
             <div class="job-id">${job.job_id.split('-')[0]}...</div>
-            <div class="job-description">${description.substring(0, 60)}...</div>
+            <div class="job-description">${descriptionText}...</div>
             <div class="job-timestamp">Submitted: ${submittedTime}</div>
         `;
 
@@ -149,7 +156,6 @@ document.addEventListener('DOMContentLoaded', () => {
         const logLine = document.createElement('div');
         logLine.className = 'log-line';
 
-        // Add color coding based on log level
         if (logMessage.includes('ERROR') || logMessage.includes('CRITICAL')) {
             logLine.classList.add('ERROR');
         } else if (logMessage.includes('WARNING')) {
@@ -165,15 +171,12 @@ document.addEventListener('DOMContentLoaded', () => {
         logFeed.scrollTop = logFeed.scrollHeight;
     }
 
-
     // --- Modal Handling ---
     function showJobDetails(jobId) {
         const job = allJobsData[jobId];
         if (!job) return;
 
         modalJobId.textContent = `Job Details: ${jobId}`;
-        
-        // Use a <pre> tag for nicely formatted JSON
         const contentHtml = `<pre>${JSON.stringify(job, null, 2)}</pre>`;
         modalDetailsContent.innerHTML = contentHtml;
 
