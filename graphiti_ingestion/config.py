@@ -32,9 +32,9 @@ class Settings(BaseSettings):
     GEMINI_MODEL_TEMPERATURE: float = 0.3
     GEMINI_MODEL_SIZE: str = "medium"
     GEMINI_DEFAULT_RERANKER: str = "gemini-2.5-flash-lite"
-    GEMINI_GLOBAL_COOLDOWN_SECONDS: float = 1.0
+    GEMINI_GLOBAL_COOLDOWN_SECONDS: float = 5.0
     GEMINI_API_KEY_COOLDOWN_SECONDS: float = 60.0
-
+    POST_SUCCESS_DELAY_SECONDS: float = 60.0
 
     # Pydantic-settings configuration
     model_config = SettingsConfigDict(

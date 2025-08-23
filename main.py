@@ -65,6 +65,10 @@ async def worker(job_manager: JobManager, graphiti_service: GraphitiService):
                         job_id, JobStatus.COMPLETED, "Episode successfully ingested."
                     )
                     logger.info(f"Worker successfully completed job {job_id}.")
+                    delay = settings.POST_SUCCESS_DELAY_SECONDS
+                    if delay > 0:
+                        logger.info(f"Success cooldown: Waiting for {delay} seconds before next job.")
+                        await asyncio.sleep(delay)
                 except Exception as e:
                     error_message = f"Failed to process episode: {e}"
                     logger.error(f"Worker failed on job {job_id}: {error_message}", exc_info=True)

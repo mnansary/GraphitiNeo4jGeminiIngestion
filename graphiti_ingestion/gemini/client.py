@@ -1,4 +1,4 @@
-# managed_gemini_client.py
+# graphiti_ingestion/gemini/client.py
 
 from __future__ import annotations
 
@@ -10,11 +10,9 @@ from asyncio import Future
 from google.genai import types
 from pydantic import BaseModel
 
-# --- Local Project Imports ---
-from graphiti_ingestion.gemini.manager import ComprehensiveManager
-from graphiti_ingestion.gemini.worker import GeminiAPIWorker
+from .manager import ComprehensiveManager
+from .worker import GeminiAPIWorker
 
-# --- Graphiti Core Imports ---
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig, ModelSize
 from graphiti_core.prompts.models import Message
@@ -39,9 +37,7 @@ class ManagedGeminiClient(LLMClient):
         super().__init__(config or LLMConfig(), cache)
         self.manager = manager
         self.config = config or LLMConfig()
-
         self._work_queue: queue.Queue = queue.Queue()
-
         self._worker = GeminiAPIWorker(
             manager=self.manager,
             work_queue=self._work_queue,
@@ -54,7 +50,7 @@ class ManagedGeminiClient(LLMClient):
         """Shut down the worker thread cleanly."""
         if self._worker.is_alive():
             self._work_queue.put(None)
-            self._worker.join()
+            self._worker.join(timeout=5.0) # Add a timeout to prevent hanging
             logger.info("ManagedGeminiClient worker has been closed.")
 
     async def _execute_job(
@@ -88,34 +84,40 @@ class ManagedGeminiClient(LLMClient):
         generation_config = types.GenerateContentConfig(
             temperature=self.config.temperature,
             max_output_tokens=max_tokens or 8192,
-            response_mime_type="application/json" if response_model else None,
-            # --- THIS IS THE CORRECTED LINE ---
+            response_mime_type="application/json" if response_model else "text/plain",
             response_schema=(
                 response_model.model_json_schema()
                 if response_model else None
             ),
-            # --- END OF CORRECTION ---
             system_instruction=system_prompt if system_prompt else None,
         )
 
         try:
             response, used_model = await self._execute_job(messages, generation_config)
         except Exception as e:
-            logger.error(f"ManagedGeminiClient: job failed in worker: {e}")
+            logger.error(f"ManagedGeminiClient: job failed in worker with a non-retryable error: {e}")
+            # Re-raise the exception so the calling service (graphiti) can handle it.
             raise
 
         raw_output = getattr(response, "text", None)
+        
+        # ---> FIX: Handle empty responses due to safety filters or other issues <---
+        if not raw_output:
+            # Graphiti expects an exception in this case.
+            raise ValueError(f"Model {used_model} returned no text for structured output. This could be due to safety filters. Full response: {response}")
+
         if response_model:
-            if not raw_output:
-                raise ValueError(f"Model {used_model} returned no text for structured output.")
             try:
+                # The API should return valid JSON, but we re-validate for safety.
                 validated = response_model.model_validate(json.loads(raw_output))
                 return validated.model_dump()
             except Exception as e:
+                # This helps debug if the model hallucinates a malformed JSON.
+                logger.error(f"Failed to parse structured JSON from model {used_model}. Raw output: {raw_output}")
                 raise ValueError(
                     f"Failed to parse structured JSON from model {used_model}: {e}"
                 ) from e
-
+        
         return {"content": raw_output}
 
     async def generate_response(
