@@ -1,0 +1,4108 @@
+================================================================================
+--- File: main.py ---
+================================================================================
+
+# main.py
+
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from graphiti_ingestion.api.dashboard import router as dashboard_router
+from graphiti_ingestion.api.dashboard_websockets import (
+    WebSocketLogHandler,
+    websocket_manager,
+)
+from graphiti_ingestion.api.episodes import router as episodes_router
+from graphiti_ingestion.config import get_settings
+from graphiti_ingestion.services.graphiti_service import (
+    GraphitiService,
+    get_graphiti_service,
+    initialize_graphiti_service,
+)
+from graphiti_ingestion.services.job_manager import (
+    JobManager,
+    JobStatus,
+    get_job_manager,
+)
+
+# --- Configuration & Logging ---
+settings = get_settings()
+logging.basicConfig(
+    level=settings.LOG_LEVEL.upper(),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
+
+MAX_CONTENT_RETRIES = 2
+
+
+# --- Background Worker ---
+async def worker(job_manager: JobManager, graphiti_service: GraphitiService):
+    """
+    The main background worker, now with intelligent failure recovery.
+    """
+    logger.info("Background worker with advanced failure recovery started.")
+    while True:
+        try:
+            job_details = await job_manager.get_next_job()
+
+            if job_details:
+                job_id, data, retry_count = job_details
+                logger.info(f"Worker processing job {job_id} (Attempt #{retry_count + 1})")
+                try:
+                    await graphiti_service.process_and_add_episode(data, retry_count=retry_count)
+                    await job_manager.update_job_status(
+                        job_id, JobStatus.COMPLETED, "Episode successfully ingested."
+                    )
+                    logger.info(f"Worker successfully completed job {job_id}.")
+                    
+                    delay = settings.POST_SUCCESS_DELAY_SECONDS
+                    if delay > 0:
+                        logger.info(f"Success cooldown: Waiting for {delay} seconds before next job.")
+                        await asyncio.sleep(delay)
+
+                except ValueError as e:
+                    error_message = str(e)
+                    logger.warning(f"Job {job_id} failed with a content error: {error_message}")
+                    if retry_count < MAX_CONTENT_RETRIES - 1:
+                        new_retry_count = retry_count + 1
+                        msg = f"Re-queuing for attempt #{new_retry_count + 1} with a better model."
+                        logger.warning(f"Job {job_id}: {msg}")
+                        await job_manager.requeue_job_for_retry(job_id, new_retry_count, msg)
+                    else:
+                        msg = f"Failed permanently after {MAX_CONTENT_RETRIES} attempts."
+                        logger.error(f"Job {job_id}: {msg}")
+                        await job_manager.update_job_status(job_id, JobStatus.FAILED, msg)
+                except Exception as e:
+                    msg = f"An unexpected error occurred: {e}"
+                    logger.error(f"Worker failed on job {job_id}: {msg}", exc_info=True)
+                    await job_manager.update_job_status(job_id, JobStatus.FAILED, msg)
+            else:
+                await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            logger.info("Background worker received cancellation request.")
+            break
+        except Exception as e:
+            logger.critical(f"A critical error occurred in the main worker loop: {e}", exc_info=True)
+            await asyncio.sleep(10)
+
+
+# --- Application Lifespan ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manages application startup and shutdown events."""
+    logger.info("Application starting up...")
+    
+    root_logger = logging.getLogger()
+    websocket_log_handler = WebSocketLogHandler(websocket_manager)
+    root_logger.addHandler(websocket_log_handler)
+    
+    graphiti_service = initialize_graphiti_service()
+    job_manager = get_job_manager()
+    await graphiti_service.startup()
+    
+    worker_task = asyncio.create_task(worker(job_manager, graphiti_service))
+    
+    yield
+    
+    logger.info("Application shutting down...")
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        logger.info("Background worker task successfully cancelled.")
+    await graphiti_service.shutdown()
+    root_logger.removeHandler(websocket_log_handler)
+    logger.info("Application shutdown complete.")
+
+
+# --- FastAPI App Initialization ---
+app = FastAPI(
+    title="Graphiti Ingestion Service with Monitoring",
+    description="An asynchronous service for ingesting data into a Neo4j knowledge graph.",
+    version="0.3.2", # Version bump for the fix
+    lifespan=lifespan,
+)
+
+app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catches all unhandled exceptions and returns a clean 500 error."""
+    logger.error(f"Unhandled exception for request {request.method} {request.url}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An internal server error occurred."},
+    )
+
+# ---> THIS IS THE CORRECTED BLOCK <---
+# We are putting the hardcoded URL back, as it's simpler and avoids the config error.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# ---> END OF CORRECTION <---
+
+app.include_router(episodes_router)
+app.include_router(dashboard_router)
+
+================================================================================
+--- File: README.md ---
+================================================================================
+
+# KnowledgeGraphNeo4j
+
+# Production Deployment Guide: Graphiti Ingestion Service
+
+## 1. Overview
+
+This guide provides a complete, step-by-step walkthrough for setting up, configuring, and deploying the Graphiti Ingestion Service in a production-like environment on a Linux server.
+
+The goal is to create a robust, persistent service that runs in the background, automatically starts on boot, and can be reliably managed. We will use `conda` for Python environment management and `systemd` for service orchestration.
+
+### Final Architecture
+
+The final setup consists of several independent services that communicate over the network. This guide focuses on deploying the central **Ingestion Service**.
+
+```+---------------------------+       +-------------------------+
+|                           |-----> |  Neo4j Database         |
+|  Graphiti Ingestion       |       |  (Docker Container)     |
+|  Service (FastAPI App)    |       +-------------------------+
+|  (systemd Service)        |
+|                           |       +-------------------------+
+|                           |-----> |  vLLM LLM Server (Gemma)|
+|                           |       |  (Docker Container)     |
++---------------------------+       +-------------------------+
+                                    |
+                                    +-------------------------+
+                                    |  Triton Embedder Server |
+                                    |  (Docker Container)     |
+                                    +-------------------------+
+```
+
+---
+
+## 2. Table of Contents
+
+- [Prerequisites](#3-prerequisites)
+- [Installation and Local Setup](#4-installation-and-local-setup)
+  - [Step 2.1: Clone the Repository](#step-21-clone-the-repository)
+  - [Step 2.2: Set Up the Conda Environment](#step-22-set-up-the-conda-environment)
+  - [Step 2.3: Install Python Dependencies](#step-23-install-python-dependencies)
+  - [Step 2.4: Configure the Application (.env)](#step-24-configure-the-application-env)
+- [Running for Development and Testing](#5-running-for-development-and-testing)
+  - [Step 3.1: Start the Server Manually](#step-31-start-the-server-manually)
+  - [Step 3.2: Test the API Endpoint](#step-32-test-the-api-endpoint)
+- [Production Deployment with `systemd`](#6-production-deployment-with-systemd)
+  - [Step 4.1: Understand the `systemd` Service File](#step-41-understand-the-systemd-service-file)
+  - [Step 4.2: Edit the Service File](#step-42-edit-the-service-file)
+  - [Step 4.3: Deploy the Service](#step-43-deploy-the-service)
+- [Managing the Production Service](#7-managing-the-production-service)
+  - [Checking Status](#checking-status)
+  - [Viewing Logs](#viewing-logs)
+  - [Stopping, Starting, and Restarting](#stopping-starting-and-restarting)
+- [Troubleshooting Common Issues](#8-troubleshooting-common-issues)
+
+---
+
+## 3. Prerequisites
+
+Before you begin, ensure your Linux server meets the following requirements:
+
+- **Hardware**: An NVIDIA GPU with sufficient VRAM for your LLM and embedder models (e.g., 24GB+ recommended).
+- **Software**:
+  - A modern Linux distribution (e.g., Ubuntu 20.04+).
+  - `git` installed.
+  - `Docker` and `docker-compose` (or `docker compose`) installed.
+  - `Miniconda` or `Anaconda` installed.
+- **Running Services**: You must have the three backing services already running and accessible from the host machine:
+  1.  **Neo4j Server**: Running in Docker as per the project's setup guide.
+  2.  **vLLM Server**: Running your Gemma model in a Docker container with the OpenAI-compatible endpoint exposed.
+  3.  **Triton Server**: Running your Jina embedder models in a Docker container.
+
+---
+
+## 4. Installation and Local Setup
+
+This section covers cloning the code and preparing the Python environment.
+
+### Step 2.1: Clone the Repository
+
+```bash
+# Clone the project into your home directory or another desired location
+git clone https://github.com/your-username/KnowledgeGraphNeo4j.git
+cd KnowledgeGraphNeo4j
+```
+
+### Step 2.2: Set Up the Conda Environment
+
+We will create a dedicated, isolated Python environment for this service.
+
+```bash
+# Create a new Conda environment named 'graphiti-ingestion' with Python 3.11
+conda create --name graphiti-ingestion python=3.11 -y
+
+# Activate the newly created environment
+conda activate graphiti-ingestion
+```
+
+### Step 2.3: Install Python Dependencies
+
+The `setup.py` file is configured to read the `requirements.txt` file. We can install the project in "editable" mode, which is the recommended approach.
+
+```bash
+# From the project root directory (e.g., ~/KnowledgeGraphNeo4j)
+pip install -e .
+```
+This command installs all required packages and makes your project's code available on the Python path without needing to reinstall after every change.
+
+### Step 2.4: Configure the Application (`.env`)
+
+Configuration is managed via an environment file.
+
+```bash
+# Create your personal configuration file from the example
+cp .env.example .env
+```
+
+**Now, you must edit the `.env` file** with the correct credentials and URLs for your setup.
+
+```ini
+# .env
+
+# --- Application Settings ---
+# Recommended log level for production is "INFO"
+LOG_LEVEL="INFO"
+
+# --- Neo4j Connection ---
+# Use bolt+ssc:// for self-signed certificates.
+# Replace 'localhost' if your DB is on another machine.
+NEO4J_URI="bolt+ssc://localhost:7687"
+NEO4J_USER="neo4j"
+NEO4J_PASSWORD="your-secure-neo4j-password-from-secrets-file"
+
+# --- vLLM (Gemma LLM) Connection ---
+# The URL to your vLLM container's OpenAI-compatible endpoint.
+VLLM_BASE_URL="http://localhost:5000/v1"
+VLLM_API_KEY="your-secret-key-if-you-configured-one"
+VLLM_MODEL_NAME="RedHatAI/gemma-3-27b-it-FP8-dynamic"
+
+# --- Triton (Jina Embedder) Connection ---
+# The URL to your Triton container.
+TRITON_URL="http://localhost:4000"
+```
+
+---
+
+## 5. Running for Development and Testing
+
+Before deploying as a system service, it's crucial to run the application manually to ensure everything is configured correctly.
+
+### Step 3.1: Start the Server Manually
+
+With your `conda activate graphiti-ingestion` environment active, run the following command from your project root:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 6000 --reload
+```
+You should see Uvicorn start up, followed by your application's log messages, including "Application starting up..." and "Background worker started."
+
+### Step 3.2: Test the API Endpoint
+
+Open a **new terminal** (do not close the server terminal) and send a test request using `curl`.
+
+```bash
+curl -X POST "http://localhost:6000/episodes/" \
+-H "Content-Type: application/json" \
+-d '{
+  "content": "The Statue of Liberty was a gift to the United States from the people of France in 1886.",
+  "type": "text",
+  "description": "Manual API test"
+}'
+```
+
+- **In the `curl` terminal:** You should get back a JSON response with a `job_id`.
+- **In the server terminal:** You should see logs indicating the request was received, the job was submitted, and the worker started processing it.
+
+If this works, you are ready for production deployment.
+
+---
+
+## 6. Production Deployment with `systemd`
+
+`systemd` is the standard service manager on modern Linux systems. It will ensure your application is always running.
+
+### Step 4.1: Understand the `systemd` Service File
+
+The `graphiti-ingestion.service` file in your project is a template that tells `systemd` how to run your application. It defines:
+- **`[Unit]`**: Metadata about the service.
+- **`[Service]`**: The core commands, user, working directory, and restart policies.
+- **`[Install]`**: How the service integrates with the system's boot process.
+
+### Step 4.2: Edit the Service File
+
+Before deploying, you **must** customize the `graphiti-ingestion.service` file with the absolute paths for your environment.
+
+```ini
+# graphiti-ingestion.service
+
+[Unit]
+Description=Graphiti Ingestion Service
+After=network.target
+
+[Service]
+# ❗️ EDIT THIS: The Linux user the service should run as.
+User=vpa
+
+# ❗️ EDIT THIS: The absolute path to your project's root directory.
+WorkingDirectory=/home/vpa/KnowledgeGraphNeo4j
+
+# ❗️ EDIT THIS: The absolute path to the Python executable in your Conda environment.
+# Find this by running: conda activate graphiti-ingestion && which python
+ExecStart=/home/vpa/miniconda3/envs/graphiti-ingestion/bin/python -m uvicorn main:app --host 0.0.0.0 --port 6000
+
+# This line automatically loads your .env file.
+EnvironmentFile=/home/vpa/KnowledgeGraphNeo4j/.env
+
+# Configuration for automatic restarts and logging.
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Step 4.3: Deploy the Service
+
+Run the following commands to copy, enable, and start your service.
+
+```bash
+# 1. Copy the customized service file to the systemd directory
+sudo cp graphiti-ingestion.service /etc/systemd/system/
+
+# 2. Reload the systemd daemon to find the new service file
+sudo systemctl daemon-reload
+
+# 3. Enable the service to start automatically on system boot
+sudo systemctl enable graphiti-ingestion.service
+
+# 4. Start the service immediately
+sudo systemctl start graphiti-ingestion.service
+```
+
+---
+
+## 7. Managing the Production Service
+
+Once deployed, use these `systemctl` commands to manage your application.
+
+### Checking Status
+
+To see if the service is active, running, and view the latest logs:
+```bash
+sudo systemctl status graphiti-ingestion.service
+```
+✅ **Good Output:** You should see `Active: active (running)` in green.
+
+### Viewing Logs
+
+`systemd` redirects all application output to the system journal.
+```bash
+# View the last 50 log lines
+sudo journalctl -u graphiti-ingestion.service -n 50
+
+# Follow the logs in real-time (like `tail -f`)
+sudo journalctl -u graphiti-ingestion.service -f
+```
+
+### Stopping, Starting, and Restarting
+
+```bash
+# Stop the service
+sudo systemctl stop graphiti-ingestion.service
+
+# Start the service
+sudo systemctl start graphiti-ingestion.service
+
+# Restart the service (e.g., after updating code or the .env file)
+sudo systemctl restart graphiti-ingestion.service
+```
+**Note**: If you change the `.service` file itself, you must run `sudo systemctl daemon-reload` before restarting.
+
+---
+
+## 8. Troubleshooting Common Issues
+
+- **Problem:** Service fails to start (`Active: failed`).
+  - **Solution:** Check the logs immediately with `sudo journalctl -u graphiti-ingestion.service`. The most common cause is an incorrect path in the `ExecStart` or `WorkingDirectory` lines of your `.service` file.
+
+- **Problem:** Application logs show connection errors.
+  - **Solution:** Ensure all your Docker services (Neo4j, vLLM, Triton) are running and that the URLs in your `.env` file are correct and accessible from the server.
+
+- **Problem:** `Permission denied` errors in the logs.
+  - **Solution:** Ensure the user specified in the `.service` file (`User=vpa`) has read/write permissions for the project directory.
+
+- **Problem:** Changes to `.env` file are not reflected.
+  - **Solution:** You must restart the service for it to reload the environment file: `sudo systemctl restart graphiti-ingestion.service`.
+
+---
+# Set up Neo4j with Docker
+
+**Action Required:** Throughout this guide, replace the placeholder `YOUR_SERVER_IP` with your machine’s actual Local Area Network (LAN) IP address (e.g., `192.168.1.101`).
+
+---
+
+### Step 1: Find Your Server's LAN IP Address (Prerequisite)
+
+First, identify the local IP address of the server that will host the Docker container. This IP will be used in the TLS certificate and the Docker port bindings.
+
+```bash
+# On Linux
+hostname -I | awk '{print $1}'
+# Or
+ip addr show
+
+# On macOS
+ifconfig | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}'
+```
+**Why this is important:** This IP is the address other machines on your network will use to connect to the database. It must be correct for the security settings to work.
+
+#### For localhost actually these are not needed
+
+
+---
+
+### Step 2: Create Project Structure and Set Permissions
+
+This step organizes all your configuration and data files and ensures the Neo4j process inside the container can access them without permission errors.
+
+```bash
+# Create the complete directory structure
+mkdir -p neo4j-local-secure/{conf,data,logs,plugins,certificates,secrets}
+cd neo4j-local-secure
+
+# Set ownership to match the container's internal neo4j user (UID 101, GID 101)
+sudo chown -R 101:101 data logs conf plugins certificates
+```
+**Why this is important:** This prevents "Permission Denied" errors when the non-root `neo4j` user in the container tries to write to the data or log directories.
+
+---
+
+### Step 3: Secure the Admin Password via Docker Secrets
+
+We will generate a strong password and store it in a file. Docker Secrets will manage this file, keeping the password out of your configuration and environment variables.
+
+```bash
+# 1. Generate a strong, random password for the 'neo4j' user
+openssl rand -base64 32 > secrets/neo4j_password
+
+# 2. Create the final secret file in the format Neo4j expects: username/<password>
+echo "neo4j/$(cat secrets/neo4j_password)" > secrets/neo4j_auth
+
+# 3. (Optional) Display the password once to save it in your password manager
+echo "Your secure password is: $(cat secrets/neo4j_password)"
+```
+**Why this is important:** This is a secure method for handling credentials, vastly superior to hardcoding them or using plain environment variables.
+
+---
+#### Alternative
+**IMPORTANT**: If you want to do it with root:The problem is a combination of file permissions in the root (`/`) directory and a common issue with how `sudo` works with output redirection (`>`).
+
+Here is the explanation and the corrected set of commands for only this step.
+
+### The Problem
+
+1.  **Directory Ownership:** When you ran `sudo mkdir -p ...`, the `secrets` directory was created and is owned by the `root` user.
+2.  **Redirection (`>`) Failure:** The command `sudo openssl ... > ...` fails because the shell (bash) tries to set up the file redirection *before* it runs the `sudo` command. Your regular user (`your non root user`) does not have permission to write to the `root`-owned `secrets` directory, so the operation fails before `openssl` even runs.
+
+### The Solution
+
+We need to pipe (`|`) the output of `openssl` to a command that can be run with `sudo` and can write to a file. The `tee` command is perfect for this.
+
+Here are the corrected commands to create your password secrets in `/neo4j-local-secure/secrets`.
+
+```bash
+# Ensure you are in the correct directory
+cd /neo4j-local-secure
+
+# --- CORRECTED COMMANDS START HERE ---
+
+# 1. Generate the password and pipe it to `tee`, which uses sudo to write the file.
+openssl rand -base64 32 | sudo tee secrets/neo4j_password > /dev/null
+
+# 2. Create the final auth secret file using the same technique.
+echo "neo4j/$(sudo cat secrets/neo4j_password)" | sudo tee secrets/neo4j_auth > /dev/null
+
+# 3. (Optional) Verify the files were created and are owned by root.
+sudo ls -l secrets
+
+# 4. (Optional) Display the password so you can save it.
+echo "Your secure password is: $(sudo cat secrets/neo4j_password)"
+```
+
+#### Command Explanation
+
+*   **`openssl rand -base64 32`**: This part is the same; it generates the random password string.
+*   **`|`**: This is the "pipe" operator. It sends the output of the command on its left as the input to the command on its right.
+*   **`sudo tee secrets/neo4j_password`**:
+    *   `tee` is a command that reads input and writes it to both the screen and a file.
+    *   By running `sudo tee`, the `tee` process itself has root privileges and therefore has permission to write the file `secrets/neo4j_password`.
+*   **`> /dev/null`**: We add this because `tee` also outputs to the screen by default. Piping the screen output to `/dev/null` (a special file that discards everything written to it) keeps your terminal clean.
+
+---
+
+### Step 4: Generate a TLS Certificate for Your IP Address (with SAN)
+
+Modern browsers and clients require the IP address to be in the **Subject Alternative Name (SAN)** field of a certificate. This command creates a certificate that is valid for your specific server IP.
+
+```bash
+# Set your server's IP address as an environment variable
+export SERVER_IP="YOUR_SERVER_IP"
+
+# Generate the key and certificate with the IP in both the CN and SAN fields
+# This single command works on most modern systems (OpenSSL ≥ 1.1.1)
+openssl req -x509 -newkey rsa:4096 -sha256 -days 365 -nodes \
+  -subj "/CN=${SERVER_IP}" \
+  -addext "subjectAltName = IP:${SERVER_IP}" \
+  -keyout certificates/private.key \
+  -out certificates/public.crt
+```
+**Why this is important:** Including the IP in the SAN is the modern standard and prevents hostname mismatch errors from clients, ensuring a secure and valid TLS connection.
+
+#### For localhost
+
+```bash
+openssl req -x509 -newkey rsa:4096 -sha256 -days 365 -nodes \
+  -subj "/CN=localhost" \
+  -addext "subjectAltName = DNS:localhost" \
+  -keyout certificates/private.key \
+  -out certificates/public.crt
+```
+
+* give access: ```sudo chown -R 101:101 certificates```
+
+---
+
+### Step 5: Configure Neo4j with Modern 5.x Settings
+
+Create the file `conf/neo4j.conf`. This configuration enforces encrypted-only connections and advertises the correct IP address to connecting clients.
+
+**Remember to replace `YOUR_SERVER_IP` in this file.**
+
+```ini
+# conf/neo4j.conf (Corrected for Neo4j 5.x)
+
+# ================= Network =================
+# Listen on all interfaces inside the container
+server.default_listen_address=0.0.0.0
+
+# Advertise the correct LAN IP to clients. CRITICAL for drivers and clustering.
+# For a LAN setup, uncomment and set this. For a pure localhost setup, leave it commented.
+# server.default_advertised_address=YOUR_SERVER_IP
+
+# ================= Connectors =================
+# Disable the insecure HTTP connector entirely.
+server.http.enabled=false
+
+# --- HTTPS Connector ---
+server.https.enabled=true
+server.https.listen_address=:7473
+# TLS configuration using SSL policy
+dbms.ssl.policy.https.enabled=true
+dbms.ssl.policy.https.base_directory=/certificates
+dbms.ssl.policy.https.private_key=private.key
+dbms.ssl.policy.https.public_certificate=public.crt
+
+# --- Bolt Connector ---
+server.bolt.enabled=true
+server.bolt.listen_address=:7687
+# Enforce encrypted connections for Bolt.
+server.bolt.tls_level=REQUIRED
+# Use the same SSL policy for Bolt
+dbms.ssl.policy.bolt.enabled=true
+dbms.ssl.policy.bolt.base_directory=/certificates
+dbms.ssl.policy.bolt.private_key=private.key
+dbms.ssl.policy.bolt.public_certificate=public.crt
+
+# ================= Security =================
+# Keep strict validation enabled. This is a critical security feature.
+server.config.strict_validation.enabled=true
+
+# ================= Memory (Tune for your machine) =================
+server.memory.heap.initial_size=4G
+server.memory.heap.max_size=4G
+server.memory.pagecache.size=8G
+```
+
+---
+
+### Step 6: Create the Docker Compose File
+
+Create the `docker-compose.yml` file. This is the heart of the deployment, binding the service specifically to your LAN IP and using the robust `cypher-shell` healthcheck.
+
+**Remember to replace `YOUR_SERVER_IP` in this file.**
+
+```yaml
+
+services:
+  neo4j:
+    image: neo4j:5-enterprise          # Tracks the latest 5.x version
+    container_name: neo4j_local_secure
+    restart: unless-stopped
+    user: "101:101"                    # Run as a non-root user
+
+    # Security: Bind host ports specifically to your LAN IP, not 0.0.0.0 (all interfaces).
+    ports:
+      - "YOUR_SERVER_IP:7473:7473"     # Secure HTTPS
+      - "YOUR_SERVER_IP:7687:7687"     # Secure Bolt
+
+    volumes:
+      - ./data:/data
+      - ./logs:/logs
+      - ./conf:/conf
+      - ./plugins:/plugins
+      - ./certificates:/certificates
+
+    environment:
+      - NEO4J_AUTH_FILE=/run/secrets/neo4j_auth_secret
+      - NEO4J_ACCEPT_LICENSE_AGREEMENT=yes
+
+    secrets:
+      - source: neo4j_auth_secret
+        target: neo4j_auth_secret
+
+    healthcheck:
+      # Robust check using cypher-shell to query the database directly.
+      # 'bolt+ssc' scheme trusts the self-signed certificate for the healthcheck.
+      test: ["CMD-SHELL", "PASS=$$(cut -d/ -f2 /run/secrets/neo4j_auth_secret) && cypher-shell -a bolt+ssc://localhost:7687 -u neo4j -p \"$$PASS\" 'RETURN 1' >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+secrets:
+  neo4j_auth_secret:
+    file: ./secrets/neo4j_auth
+```
+
+#### For localhost:
+
+```bash
+    # Security: Bind host ports specifically to localhost (127.0.0.1).
+    ports:
+      - "127.0.0.1:7473:7473"     # Accessible only from https://localhost:7473
+      - "127.0.0.1:7687:7687"     # Accessible only from bolt+ssc://localhost:7687
+```
+
+---
+
+### Step 7: Launch, Verify, and Connect
+
+You are now ready to start the service and connect from another machine on your local network.
+
+```bash
+# 1. Start the service in the background
+docker compose up -d
+
+# 2. Check the status. Wait for the STATUS to become 'running (healthy)'
+docker compose ps
+
+# 3. (Optional) Follow the logs on first startup
+docker logs -f neo4j_local_secure
+```
+
+**How to Connect:**
+
+*   **Neo4j Browser:** Navigate to `https://YOUR_SERVER_IP:7473`
+    *   *You will see a security warning. This is expected. Click "Advanced" and proceed.*
+*   **Drivers & Tools:** Use a secure connection string. The `+ssc` scheme is a convenient shortcut that trusts self-signed certificates without needing a custom trust store.
+    *   `bolt+ssc://YOUR_SERVER_IP:7687`
+*   **`cypher-shell` from your host machine:**
+    ```bash
+    cypher-shell -a bolt+ssc://YOUR_SERVER_IP:7687 -u neo4j -p "$(cat secrets/neo4j_password)"
+    ```
+
+
+#### For Localhost: 
+**Local Port Forwarding** (or an "SSH Tunnel").
+
+you bound the ports to `127.0.0.1` on the server, you cannot connect to `https://YOUR_SERVER_IP:7473`. 
+
+The solution is to tell SSH to create a secure tunnel from your local machine, through the SSH connection, directly to the `localhost` port on the remote server.
+
+### The Concept
+
+You will forward a port on your **local machine** (the one you are typing on) to the Neo4j port on the **remote server's localhost**.
+
+*   Traffic going into `localhost:7473` on **your laptop**
+*   ...travels securely through the SSH connection...
+*   ...and comes out on `localhost:7473` on the **remote server**, where Neo4j is listening.
+
+### The Solution: The `-L` Flag in SSH
+
+You need to forward two ports: `7473` for the browser (HTTPS) and `7687` for the Bolt driver. You can do this in a single SSH command by using the `-L` flag twice.
+
+#### Step 1: Disconnect and Reconnect with Port Forwarding
+
+First, if you are currently connected to your server, `exit` that SSH session.
+
+Now, reconnect using the following command. This is the **only command you need to change**.
+
+```bash
+# General Syntax: ssh -L <local_port>:<destination_host>:<destination_port> user@server
+#
+# We will forward:
+# - Our local port 7473 to the remote server's localhost:7473
+# - Our local port 7687 to the remote server's localhost:7687
+
+ssh -L 7473:localhost:7473 -L 7687:localhost:7687 vpa@172.22.11.241
+```
+
+**Command Breakdown:**
+
+*   **`ssh user@the.server.ip.addreess`**: Your standard SSH login command.
+*   **`-L 7473:localhost:7473`**:
+    *   `-L`: Specifies **L**ocal port forwarding.
+    *   `7473`: The port to open on **your local machine**.
+    *   `localhost`: The destination host *from the remote server's perspective*. We want to connect to `localhost` on the server.
+    *   `7473`: The destination port on the remote server.
+*   **`-L 7687:localhost:7687`**: Does the same thing for the Bolt port.
+
+#### Step 2: Keep the SSH Connection Open
+
+As long as this SSH terminal window is open, the secure tunnels are active. If you close this window, the tunnels will close.
+
+#### Step 3: Connect Using `localhost` on Your Local Machine
+
+Now, on your local machine (your laptop), you can access Neo4j as if it were running locally.
+
+*   **Open Your Web Browser (on your laptop):**
+    Navigate to: `https://localhost:7473`
+    *   Your browser will send the request to your local port 7473.
+    *   SSH will intercept it, send it through the tunnel, and deliver it to Neo4j on the server.
+    *   You will still see the security warning for the self-signed certificate, which is expected.
+
+*   **Use `cypher-shell` or a Driver (from your laptop):**
+    Use the connection string: `bolt+ssc://localhost:7687`
+    ```bash
+    # You would run this in a NEW terminal window on your local machine,
+    # NOT in the SSH window.
+    cypher-shell -a bolt+ssc://localhost:7687 -u neo4j -p "YOUR_SECURE_PASSWORD"
+    ```
+
+This is the standard and most secure way to manage services that are intentionally not exposed to the network. You maintain a very high level of security on the server while still having full access for management from your trusted machine.
+
+---
+
+### Step 8: Harden with a Firewall (Recommended)
+
+For true defense-in-depth, configure a firewall on the host machine to only allow traffic to the Neo4j ports from your trusted local network.
+
+**UFW (Ubuntu) Example:**
+
+```bash
+# Replace with your LAN subnet (e.g., 192.168.1.0/24)
+export LAN_SUBNET="YOUR_LAN_SUBNET"
+
+# Allow incoming connections from the LAN to the Neo4j ports
+sudo ufw allow from ${LAN_SUBNET} to any port 7473 proto tcp
+sudo ufw allow from ${LAN_SUBNET} to any port 7687 proto tcp
+
+# Ensure UFW is enabled and check the status
+sudo ufw enable
+sudo ufw status
+```
+**Why this is important:** Even if Docker is bound to a specific IP, the firewall acts as a second, powerful layer of defense against unwanted network access.
+
+
+# Connecting to Your Secure Neo4j Docker Instance
+
+This guide provides detailed instructions on how to connect to and verify your secure Neo4j 5.x Docker container. It covers all common scenarios, including connecting from the host machine, a remote machine on the same network, and securely through an SSH tunnel.
+
+## Prerequisites
+
+Before you begin, ensure you have the following information and tools:
+
+1.  **Server IP Address**: The LAN IP address of the machine hosting the Docker container (e.g., `192.168.1.101`). This will be referred to as `YOUR_SERVER_IP`.
+2.  **Neo4j Password**: The secure password you generated. You can retrieve it from the host machine at any time by running:
+    ```bash
+    # Run this from your neo4j-local-secure directory
+    sudo cat secrets/neo4j_password
+    ```
+3.  **`cypher-shell`**: The official Neo4j command-line interface. This must be installed on any machine you wish to connect from.
+
+---
+
+## Connection Methods
+
+The correct connection method depends on how you configured the `ports` section in your `docker-compose.yml` file.
+
+### Scenario 1: Ports are Bound to Your Server's LAN IP
+
+This is the standard setup for making Neo4j available to other machines on your local network. Your `docker-compose.yml` `ports` section looks like this:
+
+```yaml
+    ports:
+      - "YOUR_SERVER_IP:7473:7473" # Secure HTTPS
+      - "YOUR_SERVER_IP:7687:7687" # Secure Bolt
+```
+
+#### ► Method 1: Connecting from the Host Machine Terminal
+
+This is the most direct way to interact with the database.
+
+1.  **Open a terminal** on the machine running the Docker container.
+2.  **Navigate** to your `neo4j-local-secure` project directory.
+3.  **Run the `cypher-shell` command**:
+
+    ```bash
+    cypher-shell \
+      -a "bolt+ssc://YOUR_SERVER_IP:7687" \
+      -u neo4j \
+      -p "$(sudo cat secrets/neo4j_password)"
+    ```
+    > **Note**: The `+ssc` in the address tells the client to trust the server's **S**elf-**S**igned **C**ertificate, which is exactly what we need for this setup.
+
+4.  **Verify the connection** as described in the [Verification](#verification) section below.
+
+#### ► Method 2: Connecting from a Remote Machine Terminal
+
+You can connect from any other computer on the same LAN that has `cypher-shell` installed.
+
+1.  **Open a terminal** on your remote machine (e.g., your laptop).
+2.  **Run the `cypher-shell` command**. You will be prompted to enter your password securely.
+
+    ```bash
+    cypher-shell -a "bolt+ssc://YOUR_SERVER_IP:7687" -u neo4j
+    ```
+3.  **Enter your password** when prompted.
+4.  **Verify the connection** as described in the [Verification](#verification) section.
+
+#### ► Method 3: Connecting via Web Browser
+
+You can access the Neo4j Browser from any machine on the same LAN.
+
+1.  **Open your web browser** (Chrome, Firefox, etc.).
+2.  **Navigate to the following URL**:
+    `https://YOUR_SERVER_IP:7473`
+3.  **Handle the Security Warning**: Your browser will show a privacy or security warning because the certificate is self-signed. This is expected.
+    *   Click **"Advanced"**.
+    *   Click **"Proceed to YOUR_SERVER_IP (unsafe)"** or "Accept the Risk and Continue".
+4.  **Log in**: Use `neo4j` as the username and your secure password. The connection URI should default to `bolt://YOUR_SERVER_IP:7687`.
+5.  Click **Connect**.
+
+---
+
+### Scenario 2: Ports are Bound to `localhost` (127.0.0.1)
+
+This is a high-security setup where the database is not exposed to the network at all. Remote access is only possible via a secure SSH tunnel. Your `docker-compose.yml` `ports` section looks like this:
+
+```yaml
+    ports:
+      - "127.0.0.1:7473:7473"
+      - "127.0.0.1:7687:7687"
+```
+
+#### ► Method 1: Connecting from the Host Machine (Terminal & Browser)
+
+Connecting from the host is simple because you are already on `localhost`.
+
+*   **Terminal**:
+    ```bash
+    cypher-shell \
+      -a "bolt+ssc://localhost:7687" \
+      -u neo4j \
+      -p "$(sudo cat secrets/neo4j_password)"
+    ```
+*   **Browser**:
+    1.  Navigate to `https://localhost:7473`.
+    2.  Bypass the security warning as explained above.
+    3.  Log in with your credentials.
+
+#### ► Method 2: Connecting from a Remote Machine (via SSH Tunnel)
+
+This is the standard, secure way to manage a service that is not exposed to the network.
+
+1.  **Establish the SSH Tunnel**: From your remote machine's terminal, run the following command to connect to your server. This command forwards your local ports `7473` and `7687` through the SSH connection to the server's `localhost`.
+
+    ```bash
+    # Syntax: ssh -L <local_port>:<destination_host>:<destination_port> user@server
+    ssh -L 7473:localhost:7473 -L 7687:localhost:7687 your_user@YOUR_SERVER_IP
+    ```
+    **Important**: You must keep this SSH terminal window open. The tunnel remains active only as long as this connection is open.
+
+2.  **Connect in a *New* Terminal or Browser**: With the tunnel active, open a **new** terminal window or your browser on your remote machine and connect to `localhost` as if Neo4j were running locally.
+
+    *   **New Terminal**:
+        ```bash
+        # Connect to your local port, which SSH will forward to the server
+        cypher-shell -a "bolt+ssc://localhost:7687" -u neo4j
+        ```
+    *   **Browser**:
+        1.  Navigate to `https://localhost:7473`.
+        2.  Bypass the security warning.
+        3.  Log in. Your traffic will be securely tunneled to the server.
+
+---
+
+## Verification
+
+A successful connection can be confirmed in two ways.
+
+### In `cypher-shell`
+
+Upon successful connection, your terminal prompt will change to:
+`neo4j@bolt+ssc://...> `
+
+Run this basic command to confirm the database is responsive:
+
+```cypher
+SHOW DATABASES;
+```
+
+A successful query will return a table of the available databases:
+
+```
++--------------------------------------------------------------------------------------------+
+| name     | type       | aliases | access      | address               | role      | writer |
++--------------------------------------------------------------------------------------------+
+| "neo4j"  | "standard" | []      | "read-write"| "localhost:7687"      | "primary" | TRUE   |
+| "system" | "system"   | []      | "read-write"| "localhost:7687"      | "primary" | TRUE   |
++--------------------------------------------------------------------------------------------+
+```
+
+To exit the shell, type `:exit` and press Enter.
+
+### In Neo4j Browser
+
+After logging in, you will see the main Neo4j Browser interface. The top-left corner will show that you are connected to the database, and you can type Cypher queries into the editor at the top of the screen.
+
+
+---
+
+# Managing Graph Data in Your Secure Neo4j Docker Instance
+
+This guide provides essential instructions for managing the data within your Neo4j database. It covers how to perform logical exports of your entire graph into portable formats and how to completely clear the database of all nodes and relationships for a clean reset.
+
+These operations are performed while the database is running and do not require you to stop the container.
+
+## Table of Contents
+- [Prerequisite: Installing the APOC Plugin](#prerequisite-installing-the-apoc-plugin)
+- [Exporting All Graph Data](#exporting-all-graph-data)
+- [Deleting All Graph Data](#deleting-all-graph-data)
+
+---
+
+## Prerequisite: Installing the APOC Plugin
+
+The most powerful and flexible way to manage data is with the **APOC ("Awesome Procedures On Cypher")** library. This is a one-time setup.
+
+1.  **Download APOC**: Go to the [APOC Releases page](https://github.com/neo4j-contrib/neo4j-apoc-procedures/releases) and find the release that **exactly matches your Neo4j version**. For example, if you are using Neo4j `5.26.10`, download the APOC `5.26.10` JAR file.
+    *   Under the "Assets" section, download the file named `apoc-x.x.x-core.jar`.
+
+2.  **Place the Plugin**: Move the downloaded `.jar` file into the `./plugins` directory of your project on the host machine.
+    ```bash
+    # Example command
+    mv ~/Downloads/apoc-5.26.10-core.jar ./plugins/
+    ```
+
+3.  **Configure Neo4j to Allow APOC**: Edit your `conf/neo4j.conf` file and add the following line. This gives APOC the necessary permissions to perform operations like writing files.
+
+    ```ini
+    # Add this line to the end of your conf/neo4j.conf
+    dbms.security.procedures.unrestricted=apoc.*
+    ```
+
+4.  **Restart the Container**: To load the plugin and apply the new configuration, restart your Docker service from your project directory.
+    ```bash
+    docker compose down && docker compose up -d
+    ```
+
+---
+
+## Exporting All Graph Data
+
+These procedures export your data into files saved on the host machine, making them easy to access, share, or use for migration.
+
+#### Setup: Create a Shared Directory for Exports
+
+To easily retrieve exported files, we'll map a local directory into the container.
+
+1.  **Create an `exports` directory** on your host:
+    ```bash
+    mkdir ./exports
+    ```
+2.  **Add the volume to `docker-compose.yml`**:
+    ```yaml
+    # in your docker-compose.yml
+    services:
+      neo4j:
+        # ... other settings
+        volumes:
+          - ./data:/data
+          - ./logs:/logs
+          - ./conf:/conf
+          - ./plugins:/plugins
+          - ./certificates:/certificates
+          - ./exports:/exports   # <--- ADD THIS LINE
+    ```
+3.  **Restart the container** if you just added the volume: `docker compose up -d --force-recreate`.
+
+#### ► Export Option 1: Cypher Script
+This method creates a single `.cypher` file containing all the `CREATE` statements needed to perfectly rebuild your graph. It is ideal for backups and migrations to other Neo4j instances.
+
+Connect to your database via `cypher-shell` or the Neo4j Browser and run:
+```cypher
+/*
+  This procedure will create a 'all-data.cypher' file
+  inside the ./exports directory on your host machine.
+*/
+CALL apoc.export.cypher.all('all-data.cypher', {
+  format: 'cypher-shell',
+  useOptimizations: {type: 'UNWIND', unwindBatchSize: 100}
+});
+```
+
+#### ► Export Option 2: GraphML
+GraphML is a standard XML-based format that can be imported into other graph visualization and analysis tools, such as Gephi.
+
+```cypher
+/*
+  This procedure will create a 'all-data.graphml' file
+  inside the ./exports directory on your host machine.
+*/
+CALL apoc.export.graphml.all('all-data.graphml', {});
+```
+
+---
+
+## Deleting All Graph Data
+
+This action removes **all nodes and relationships** from your `neo4j` database. It does **not** remove your user accounts, and it leaves your schema (indexes and constraints) intact.
+
+#### ► Method 1: Simple Delete (For Small to Medium Graphs)
+This command is easy to remember and effective for databases that are not excessively large.
+
+```cypher
+MATCH (n) DETACH DELETE n;
+```
+> **Warning**: On very large graphs (millions of nodes/edges), this single transaction can consume a large amount of memory and may fail. For large datasets, use the batched method below.
+
+#### ► Method 2: Batched Delete (For Very Large Graphs)
+This is the recommended, robust method for clearing any size of graph. It uses an APOC procedure to delete nodes in smaller, manageable batches, preventing memory issues.
+
+```cypher
+/*
+  This procedure finds all nodes and runs DETACH DELETE on them in
+  batches of 50,000 until the database is empty.
+*/
+CALL apoc.periodic.iterate(
+  'MATCH (n) RETURN n',
+  'DETACH DELETE n',
+  {batchSize: 50000}
+)
+YIELD batches, total;
+```
+
+#### Verification
+After running a delete command, you can confirm the database is empty with the following query. The expected result is `0`.
+```cypher
+MATCH (n) RETURN count(n);
+```
+
+================================================================================
+--- File: requirements.txt ---
+================================================================================
+
+# --- Web Framework & Server ---
+fastapi
+uvicorn[standard]
+
+# --- Graph & Database ---
+graphiti-core
+neo4j
+
+# --- Configuration ---
+pydantic-settings
+python-dotenv
+
+# --- AI/ML Service Clients ---
+openai
+aiohttp
+
+# --- Embedder & Tokenizer Dependencies ---
+transformers
+numpy~=1.26.4
+torch
+sentencepiece
+
+================================================================================
+--- File: .env ---
+================================================================================
+
+# .env
+
+# --- Application Settings ---
+LOG_LEVEL="INFO"
+JOB_QUEUE_PATH="/home/vpa/downloads/gemini_ingestion_jobs"
+# --- Neo4j Connection ---
+NEO4J_URI="bolt+ssc://localhost:7687"
+NEO4J_USER="neo4j"
+NEO4J_PASSWORD="UZC96B9INkLB0b2uwjZBJ1UUXciwSzMeRB1ECSQM94M="
+
+# --- Triton (Jina Embedder) Connection ---
+TRITON_URL="http://172.22.8.106/jinatriton/"
+
+# --- Path to the CSV file containing your Google API keys under an 'api' header. ---
+GEMINI_API_CSV_PATH= "/home/vpa/downloads/google_apis.csv"
+# --- Path to the YAML file defining model capabilities and task mappings. ---
+GEMINI_MODEL_CONFIG="configs/gemini.yaml"
+# --- The model Temperature to use ---
+GEMINI_MODEL_TEMPERATURE=0.3
+# --- model size ---
+GEMINI_MODEL_SIZE="medium"
+# --- reranker model ---
+GEMINI_DEFAULT_RERANKER="gemini-2.5-flash-lite"
+# --- Delay in seconds between every API call to pace the requests globally. ---
+GEMINI_GLOBAL_COOLDOWN_SECONDS=5.0
+# --- Cooldown period in seconds for a specific API key after it has been used. ---
+GEMINI_API_KEY_COOLDOWN_SECONDS=60.0
+# ---  delay after one job success ---
+POST_SUCCESS_DELAY_SECONDS=60
+
+================================================================================
+--- File: graphiti-ingestion.service ---
+================================================================================
+
+# /home/vpa/KnowledgeGraphNeo4j/graphiti-ingestion.service
+
+[Unit]
+Description=Graphiti Ingestion Service
+# This service will start after the network is available.
+After=network.target
+
+[Service]
+# --- User and Working Directory ---
+# The user that will run the service, based on your home directory.
+User=vpa
+# The absolute path to the root directory of your project.
+WorkingDirectory=/home/vpa/KnowledgeGraphNeo4j
+
+# --- Execution Command ---
+# This command uses the specific Python from your 'base' conda environment
+# to run the uvicorn module, starting your FastAPI app on port 6000.
+ExecStart=/home/vpa/miniconda3/bin/python -m uvicorn main:app --host 127.0.0.1 --port 6000 --forwarded-allow-ips='*'
+
+# --- Environment Configuration ---
+# This line tells systemd to load all variables from your .env file.
+EnvironmentFile=/home/vpa/KnowledgeGraphNeo4j/.env
+
+# --- Process Management ---
+# Restart the service automatically if it crashes.
+Restart=always
+# Wait 10 seconds before attempting to restart.
+RestartSec=10
+# Set a timeout for stopping the service.
+TimeoutStopSec=30
+
+# --- Logging ---
+# Redirect standard output and error to the system's journal.
+# This allows you to view logs with `journalctl`.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# This line enables the service to be started at boot time.
+WantedBy=multi-user.target
+
+================================================================================
+--- File: setup.py ---
+================================================================================
+
+# setup.py
+
+from setuptools import setup, find_packages
+
+# --- Read the contents of your README file ---
+# This will be used as the long description for your package
+with open("README.md", "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
+# --- Read the contents of your requirements file ---
+# This will be used to automatically define the package's dependencies
+with open("requirements.txt", "r") as f:
+    install_requires = [
+        line.strip() for line in f if line.strip() and not line.startswith("#")
+    ]
+
+
+setup(
+    # --- Core Metadata ---
+    name='graphiti-ingestion-service',
+    version='0.1.0',
+
+    # --- Author and Project Links ---
+    author='mnansary',
+    author_email='nazmuddoha.ansary.28@gmail.com',
+    description='An asynchronous service to ingest data into a Neo4j knowledge graph using Graphiti, vLLM, and Triton.',
+    long_description=long_description,
+    long_description_content_type="text/markdown",
+    url='https://github.com/mnansary/KnowledgeGraphNeo4j',  # URL to your project's repository
+
+    # --- Package Discovery ---
+    # find_packages() automatically finds all packages (directories with an __init__.py)
+    # in your project. We can specify where to look.
+    packages=find_packages(where=".", include=["graphiti_ingestion*"]),
+
+    # --- Dependencies ---
+    # This list is now dynamically read from your requirements.txt file.
+    install_requires=install_requires,
+
+    # --- Python Version Requirement ---
+    # Specify the minimum version of Python required to run your project.
+    python_requires='>=3.9',
+
+    # --- Classifiers ---
+    # These are standard markers that help tools like pip and PyPI categorize your project.
+    classifiers=[
+        "Development Status :: 4 - Beta",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Operating System :: OS Independent",
+        "Intended Audience :: Developers",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+        "Topic :: Database",
+        "Framework :: FastAPI",
+    ],
+)
+
+================================================================================
+--- File: .env.example ---
+================================================================================
+
+# .env
+
+# --- Application Settings ---
+LOG_LEVEL="INFO"
+JOB_QUEUE_PATH="./jobs"
+# --- Neo4j Connection ---
+NEO4J_URI="bolt+ssc://localhost:7687"
+NEO4J_USER="neo4j"
+NEO4J_PASSWORD="your-neo4j-secure-password"
+
+# --- Triton (Jina Embedder) Connection ---
+TRITON_URL="http://localhost:4000"
+
+# --- Path to the CSV file containing your Google API keys under an 'api' header. ---
+GEMINI_API_CSV_PATH= "path to you gemini api csv file"
+# --- Path to the YAML file defining model capabilities and task mappings. ---
+GEMINI_MODEL_CONFIG="configs/gemini.yaml"
+# --- The model Temperature to use ---
+GEMINI_MODEL_TEMPERATURE=0.3
+# --- model size ---
+GEMINI_MODEL_SIZE="medium"
+# --- reranker model ---
+GEMINI_DEFAULT_RERANKER="gemini-2.5-flash-lite"
+
+# Delay in seconds between every API call to pace the requests globally.
+GEMINI_GLOBAL_COOLDOWN_SECONDS=1.0
+# Cooldown period in seconds for a specific API key after it has been used.
+GEMINI_API_KEY_COOLDOWN_SECONDS=60.0
+# delay after episode success
+POST_SUCCESS_DELAY_SECONDS=60.0
+
+================================================================================
+--- File: static/dashboard.js ---
+================================================================================
+
+// static/dashboard.js
+
+document.addEventListener('DOMContentLoaded', () => {
+    // --- DOM Element References ---
+    const connectionStatusLight = document.getElementById('status-light');
+    const connectionStatusText = document.getElementById('status-text');
+    const logFeed = document.getElementById('log-feed');
+    const modal = document.getElementById('job-details-modal');
+    const closeModalButton = document.getElementById('close-modal-button');
+    const modalJobId = document.getElementById('modal-job-id');
+    const modalDetailsContent = document.getElementById('modal-details-content');
+
+    const jobLists = {
+        pending: document.getElementById('pending-list'),
+        processing: document.getElementById('processing-list'),
+        completed: document.getElementById('completed-list'),
+        failed: document.getElementById('failed-list'),
+    };
+
+    const jobCounts = {
+        pending: document.getElementById('pending-count'),
+        processing: document.getElementById('processing-count'),
+        completed: document.getElementById('completed-count'),
+        failed: document.getElementById('failed-count'),
+    };
+
+    // Store all job data in memory for quick access and real-time updates
+    let allJobsData = {};
+    let socket;
+
+    // --- WebSocket Connection Handling ---
+    function connectWebSocket() {
+        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${wsProtocol}//${window.location.host}/ingestion/dashboard/ws/dashboard`;
+
+        console.log(`Attempting to connect to WebSocket at: ${wsUrl}`);
+        socket = new WebSocket(wsUrl);
+
+        socket.onopen = () => {
+            console.log('WebSocket connection established.');
+            updateConnectionStatus(true);
+            // Request the initial full list of jobs upon connecting
+            socket.send(JSON.stringify({ action: 'get_all_jobs' }));
+        };
+
+        socket.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            handleWebSocketMessage(data);
+        };
+
+        socket.onclose = () => {
+            console.log('WebSocket connection closed. Attempting to reconnect in 3 seconds...');
+            updateConnectionStatus(false);
+            setTimeout(connectWebSocket, 3000);
+        };
+
+        socket.onerror = (error) => {
+            console.error('WebSocket error:', error);
+            updateConnectionStatus(false);
+            socket.close();
+        };
+    }
+
+    function updateConnectionStatus(isConnected) {
+        if (isConnected) {
+            connectionStatusLight.className = 'status-light connected';
+            connectionStatusText.textContent = 'Connected';
+        } else {
+            connectionStatusLight.className = 'status-light disconnected';
+            connectionStatusText.textContent = 'Disconnected';
+        }
+    }
+
+    // --- WebSocket Message Processing ---
+    function handleWebSocketMessage(data) {
+        switch (data.type) {
+            case 'log':
+                appendLogLine(data.payload);
+                break;
+            case 'all_jobs':
+                // Received the initial snapshot of all jobs
+                allJobsData = {}; // Clear existing data
+                data.payload.forEach(job => {
+                    allJobsData[job.job_id] = job;
+                });
+                renderAllJobs();
+                break;
+            
+            // ---> THIS IS THE NEW, REAL-TIME LOGIC <---
+            case 'job_update':
+                // A single job has been submitted or has changed state.
+                const updatedJob = data.payload;
+                console.log('Received job_update:', updatedJob);
+
+                // Update the job in our local data store.
+                allJobsData[updatedJob.job_id] = updatedJob;
+                
+                // Re-render the entire board. This is the simplest way
+                // to ensure the job card moves to the correct column.
+                renderAllJobs();
+                break;
+        }
+    }
+
+    // --- UI Rendering ---
+    function renderAllJobs() {
+        // Clear all current lists to prevent duplicates
+        Object.values(jobLists).forEach(list => list.innerHTML = '');
+        
+        const counts = { pending: 0, processing: 0, completed: 0, failed: 0 };
+
+        // Sort jobs by submission date (newest first) for a consistent order
+        const sortedJobs = Object.values(allJobsData).sort(
+            (a, b) => new Date(b.submitted_at) - new Date(a.submitted_at)
+        );
+
+        // Create and append job cards to the correct columns
+        sortedJobs.forEach(job => {
+            const status = job.status;
+            if (jobLists[status]) {
+                const jobCard = createJobCard(job);
+                jobLists[status].appendChild(jobCard);
+                counts[status]++;
+            }
+        });
+
+        // Update the count display in each column header
+        Object.keys(counts).forEach(status => {
+            jobCounts[status].textContent = counts[status];
+        });
+    }
+
+    function createJobCard(job) {
+        const card = document.createElement('div');
+        card.className = `job-card ${job.status}`;
+        card.dataset.jobId = job.job_id;
+
+        // Use a more descriptive text for the card
+        const descriptionText = (job.status === 'completed' && job.processing_time_seconds)
+            ? `Completed in ${job.processing_time_seconds}s`
+            : job.message.substring(0, 60);
+        
+        const submittedTime = new Date(job.submitted_at).toLocaleString();
+
+        card.innerHTML = `
+            <div class="job-id">${job.job_id.split('-')[0]}...</div>
+            <div class="job-description">${descriptionText}...</div>
+            <div class="job-timestamp">Submitted: ${submittedTime}</div>
+        `;
+
+        card.addEventListener('click', () => showJobDetails(job.job_id));
+        return card;
+    }
+
+    function appendLogLine(logMessage) {
+        const logLine = document.createElement('div');
+        logLine.className = 'log-line';
+
+        if (logMessage.includes('ERROR') || logMessage.includes('CRITICAL')) {
+            logLine.classList.add('ERROR');
+        } else if (logMessage.includes('WARNING')) {
+            logLine.classList.add('WARNING');
+        } else {
+            logLine.classList.add('INFO');
+        }
+
+        logLine.textContent = logMessage;
+        logFeed.appendChild(logLine);
+
+        // Auto-scroll to the bottom
+        logFeed.scrollTop = logFeed.scrollHeight;
+    }
+
+    // --- Modal Handling ---
+    function showJobDetails(jobId) {
+        const job = allJobsData[jobId];
+        if (!job) return;
+
+        modalJobId.textContent = `Job Details: ${jobId}`;
+        const contentHtml = `<pre>${JSON.stringify(job, null, 2)}</pre>`;
+        modalDetailsContent.innerHTML = contentHtml;
+
+        modal.style.display = 'block';
+    }
+
+    function hideModal() {
+        modal.style.display = 'none';
+    }
+
+    closeModalButton.addEventListener('click', hideModal);
+    window.addEventListener('click', (event) => {
+        if (event.target === modal) {
+            hideModal();
+        }
+    });
+
+    // --- Initial Kick-off ---
+    connectWebSocket();
+});
+
+================================================================================
+--- File: static/styles.css ---
+================================================================================
+
+/* static/styles.css */
+
+/* --- Global Styles & Variables --- */
+:root {
+    --bg-color: #1a1d24;
+    --primary-surface: #2c313a;
+    --secondary-surface: #22262e;
+    --border-color: #444a58;
+    --primary-text: #e1e1e1;
+    --secondary-text: #a0a8b4;
+    --font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    --font-family-mono: 'Consolas', 'Courier New', monospace;
+
+    --color-pending: #3b82f6; /* Blue */
+    --color-processing: #f59e0b; /* Amber */
+    --color-completed: #22c55e; /* Green */
+    --color-failed: #ef4444; /* Red */
+    --color-connected: #22c55e;
+    --color-disconnected: #ef4444;
+}
+
+body {
+    background-color: var(--bg-color);
+    color: var(--primary-text);
+    font-family: var(--font-family);
+    margin: 0;
+    padding: 1rem;
+    overflow-x: hidden;
+}
+
+/* --- Header --- */
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.5rem 1.5rem;
+    background-color: var(--secondary-surface);
+    border-bottom: 1px solid var(--border-color);
+    border-radius: 8px;
+    margin-bottom: 1.5rem;
+}
+
+header h1 {
+    font-size: 1.5rem;
+    margin: 0;
+}
+
+.connection-status {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+}
+
+.status-light {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background-color: var(--color-processing); /* Default yellow */
+    transition: background-color 0.3s ease;
+}
+
+.status-light.connected {
+    background-color: var(--color-connected);
+}
+
+.status-light.disconnected {
+    background-color: var(--color-disconnected);
+}
+
+/* --- Main Layout --- */
+.dashboard-container {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+}
+
+.job-columns {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1.5rem;
+}
+
+.job-column {
+    background-color: var(--secondary-surface);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    padding: 1rem;
+}
+
+.job-column h2 {
+    margin-top: 0;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border-color);
+    font-size: 1.1rem;
+    color: var(--primary-text);
+}
+
+#pending-column h2 { border-color: var(--color-pending); }
+#processing-column h2 { border-color: var(--color-processing); }
+#completed-column h2 { border-color: var(--color-completed); }
+#failed-column h2 { border-color: var(--color-failed); }
+
+.job-list {
+    flex-grow: 1;
+    overflow-y: auto;
+    height: 40vh; /* Adjust height as needed */
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding-right: 0.5rem; /* For scrollbar */
+}
+
+/* --- Job Card Styling --- */
+.job-card {
+    background-color: var(--primary-surface);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    border-left: 5px solid var(--border-color);
+    cursor: pointer;
+    transition: transform 0.2s ease, background-color 0.2s ease;
+    word-wrap: break-word;
+}
+
+.job-card:hover {
+    transform: translateY(-2px);
+    background-color: #383e4a;
+}
+
+.job-card .job-id {
+    font-family: var(--font-family-mono);
+    font-weight: bold;
+    font-size: 0.9rem;
+    margin-bottom: 0.25rem;
+}
+
+.job-card .job-description {
+    font-size: 0.85rem;
+    color: var(--secondary-text);
+    margin-bottom: 0.5rem;
+}
+
+.job-card .job-timestamp {
+    font-size: 0.75rem;
+    color: var(--secondary-text);
+    opacity: 0.7;
+}
+
+/* Card border colors based on status */
+.job-card.pending { border-color: var(--color-pending); }
+.job-card.processing { border-color: var(--color-processing); }
+.job-card.completed { border-color: var(--color-completed); }
+.job-card.failed { border-color: var(--color-failed); }
+
+
+/* --- Log Container --- */
+.log-container {
+    background-color: var(--secondary-surface);
+    border-radius: 8px;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+}
+
+.log-container h2 {
+    margin-top: 0;
+    font-size: 1.1rem;
+}
+
+.log-feed {
+    background-color: #111317; /* Darker for contrast */
+    border-radius: 6px;
+    padding: 1rem;
+    height: 45vh; /* Adjust height as needed */
+    overflow-y: auto;
+    font-family: var(--font-family-mono);
+    font-size: 0.85rem;
+    white-space: pre-wrap; /* Wrap long lines */
+    color: var(--secondary-text);
+}
+
+.log-line {
+    line-height: 1.5;
+}
+
+.log-line.INFO { color: #a0a8b4; }
+.log-line.WARNING { color: #facc15; } /* Yellow */
+.log-line.ERROR, .log-line.CRITICAL { color: #f87171; } /* Light Red */
+
+
+/* --- Modal for Job Details --- */
+.modal {
+    display: none; /* Hidden by default */
+    position: fixed;
+    z-index: 1000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    overflow: auto;
+    background-color: rgba(0, 0, 0, 0.7);
+    animation: fadeIn 0.3s;
+}
+
+.modal-content {
+    background-color: var(--primary-surface);
+    margin: 10% auto;
+    padding: 2rem;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    width: 60%;
+    max-width: 800px;
+    position: relative;
+    box-shadow: 0 5px 15px rgba(0,0,0,0.5);
+    animation: slideIn 0.4s;
+}
+
+.close-button {
+    color: var(--secondary-text);
+    position: absolute;
+    top: 1rem;
+    right: 1.5rem;
+    font-size: 2rem;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+.close-button:hover {
+    color: var(--primary-text);
+}
+
+#modal-details-content pre {
+    background-color: #111317;
+    padding: 1rem;
+    border-radius: 6px;
+    max-height: 50vh;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-size: 0.9rem;
+}
+
+/* --- Scrollbar Styling --- */
+::-webkit-scrollbar {
+    width: 8px;
+}
+::-webkit-scrollbar-track {
+    background: var(--secondary-surface);
+    border-radius: 10px;
+}
+::-webkit-scrollbar-thumb {
+    background: #555c6b;
+    border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: #71798a;
+}
+
+/* --- Animations --- */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideIn {
+  from { transform: translateY(-50px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+/* --- Responsive Design --- */
+@media (max-width: 1200px) {
+    .job-columns {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+@media (max-width: 768px) {
+    .job-columns {
+        grid-template-columns: 1fr;
+    }
+    header {
+        flex-direction: column;
+        gap: 0.75rem;
+        align-items: flex-start;
+    }
+    .modal-content {
+        width: 90%;
+        margin: 5% auto;
+    }
+}
+
+================================================================================
+--- File: static/index.html ---
+================================================================================
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Graphiti Ingestion Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <!-- Header Section -->
+    <header>
+        <h1>Graphiti Ingestion Service Dashboard</h1>
+        <div class="connection-status" id="connection-status">
+            <div class="status-light" id="status-light"></div>
+            <span id="status-text">Connecting...</span>
+        </div>
+    </header>
+
+    <!-- Main Dashboard Content -->
+    <main class="dashboard-container">
+        <!-- Job Status Columns -->
+        <div class="job-columns">
+            <div class="job-column" id="pending-column">
+                <h2>Pending (<span id="pending-count">0</span>)</h2>
+                <div class="job-list" id="pending-list"></div>
+            </div>
+            <div class="job-column" id="processing-column">
+                <h2>Processing (<span id="processing-count">0</span>)</h2>
+                <div class="job-list" id="processing-list"></div>
+            </div>
+            <div class="job-column" id="completed-column">
+                <h2>Completed (<span id="completed-count">0</span>)</h2>
+                <div class="job-list" id="completed-list"></div>
+            </div>
+            <div class="job-column" id="failed-column">
+                <h2>Failed (<span id="failed-count">0</span>)</h2>
+                <div class="job-list" id="failed-list"></div>
+            </div>
+        </div>
+
+        <!-- Live Log Feed Section -->
+        <div class="log-container">
+            <h2>Live Application Logs</h2>
+            <div class="log-feed" id="log-feed">
+                <!-- Log lines will be inserted here by JavaScript -->
+            </div>
+        </div>
+    </main>
+
+    <!-- Job Details Modal (Initially Hidden) -->
+    <div id="job-details-modal" class="modal">
+        <div class="modal-content">
+            <span class="close-button" id="close-modal-button">&times;</span>
+            <h2 id="modal-job-id">Job Details</h2>
+            <div id="modal-details-content">
+                <!-- Job details will be dynamically inserted here -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Link to the JavaScript file -->
+    <script src="/static/dashboard.js"></script>
+</body>
+</html>
+
+================================================================================
+--- File: graphiti_ingestion/config.py ---
+================================================================================
+
+# graphiti_ingestion/config.py
+
+import logging
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import DirectoryPath
+
+logger = logging.getLogger(__name__)
+
+
+class Settings(BaseSettings):
+    """
+    Defines the application's configuration settings, loaded from a .env file.
+    Pydantic automatically validates the types and presence of these settings.
+    """
+    # --- Application Settings ---
+    LOG_LEVEL: str = "INFO"
+    JOB_QUEUE_PATH: DirectoryPath # Ensures the path exists
+
+    # --- Neo4j Connection ---
+    NEO4J_URI: str
+    NEO4J_USER: str
+    NEO4J_PASSWORD: str
+
+    # --- Triton (Jina Embedder) Connection ---d
+    TRITON_URL: str
+    
+    # --- Gemini API Manager Settings ---
+    GEMINI_API_CSV_PATH: str
+    GEMINI_MODEL_CONFIG: str
+    GEMINI_MODEL_TEMPERATURE: float = 0.3
+    GEMINI_MODEL_SIZE: str = "medium"
+    GEMINI_DEFAULT_RERANKER: str = "gemini-2.5-flash-lite"
+    GEMINI_GLOBAL_COOLDOWN_SECONDS: float = 5.0
+    GEMINI_API_KEY_COOLDOWN_SECONDS: float = 60.0
+    POST_SUCCESS_DELAY_SECONDS: float = 60.0
+
+    # Pydantic-settings configuration
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"  # Ignore extra fields in the environment
+    )
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """
+    Returns the singleton instance of the Settings object.
+
+    The @lru_cache decorator ensures that the Settings are loaded from the
+    .env file only once, making it an efficient way to access configuration.
+    """
+    logger.info("Loading application settings from .env file...")
+    try:
+        settings = Settings()
+        return settings
+    except Exception as e:
+        logger.critical(f"FATAL: Failed to load settings from .env file: {e}", exc_info=True)
+        raise
+
+# You can optionally log the loaded settings on startup for verification
+# settings = get_settings()
+# logger.debug(f"Loaded settings: {settings.model_dump(exclude={'NEO4J_PASSWORD'})}")
+
+================================================================================
+--- File: graphiti_ingestion/__init__.py ---
+================================================================================
+
+
+
+================================================================================
+--- File: graphiti_ingestion/api/episodes.py ---
+================================================================================
+
+# graphiti_ingestion/api/episodes.py
+
+import uuid
+from fastapi import APIRouter, Depends, HTTPException, status
+
+from ..models.episodes import (
+    EpisodeRequest,
+    EpisodeResponse,
+    JobStatusResponse,
+)
+from ..services.job_manager import JobManager, get_job_manager
+
+router = APIRouter(
+    prefix="/episodes",
+    tags=["Episodes"],
+    responses={
+        404: {"description": "Job not found"},
+        500: {"description": "Internal server error"}
+    },
+)
+
+
+@router.post(
+    "/",
+    response_model=EpisodeResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Submit an episode for ingestion",
+    description=(
+        "Accepts episode content, type, and description. The request is "
+        "persistently saved to a file-based queue for background processing. "
+        "A unique job ID is returned immediately to the client for status tracking."
+    ),
+)
+async def submit_episode(
+    episode_request: EpisodeRequest,
+    job_manager: JobManager = Depends(get_job_manager),
+) -> EpisodeResponse:
+    """
+    Submits a new episode to the persistent ingestion queue.
+
+    This endpoint is non-blocking. It generates a unique job ID, saves the
+    request payload as a JSON file in the 'pending' queue directory, and
+    immediately returns the job ID.
+
+    Args:
+        episode_request: The Pydantic model containing the episode data from the client.
+        job_manager: The dependency-injected job manager service that handles
+                     the file-based queue.
+
+    Returns:
+        An EpisodeResponse containing the generated job_id and initial status.
+    """
+    job_id = str(uuid.uuid4())
+    await job_manager.submit_job(job_id, episode_request.model_dump())
+
+    return EpisodeResponse(
+        job_id=job_id,
+        status="pending",
+        message="Episode accepted for processing and saved to disk.",
+    )
+
+
+@router.get(
+    "/status/{job_id}",
+    response_model=JobStatusResponse,
+    summary="Check the status of an ingestion job",
+    description="Retrieves the current processing status of a previously submitted episode by querying the file-based queue.",
+)
+async def get_job_status(
+    job_id: str,
+    job_manager: JobManager = Depends(get_job_manager),
+) -> JobStatusResponse:
+    """
+    Retrieves the status of a specific ingestion job by its ID.
+
+    The job manager locates the job's status file across all state directories
+    (pending, processing, completed, failed) to provide the most current information.
+
+    Args:
+        job_id: The unique identifier for the job, provided upon submission.
+        job_manager: The dependency-injected job manager service.
+
+    Returns:
+        The current status of the job, including a descriptive message.
+
+    Raises:
+        HTTPException (404 Not Found): If a job with the specified ID cannot be found.
+    """
+
+    status_info = await job_manager.get_job_status(job_id)
+
+    if status_info is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job with ID '{job_id}' not found.",
+        )
+
+    return JobStatusResponse(**status_info)
+
+================================================================================
+--- File: graphiti_ingestion/api/dashboard.py ---
+================================================================================
+
+# graphiti_ingestion/api/dashboard.py
+
+import json
+import logging
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+
+from ..services.job_manager import JobManager, get_job_manager
+from .dashboard_websockets import websocket_manager
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/dashboard",
+    tags=["Dashboard"],
+    responses={404: {"description": "Not found"}},
+)
+
+# Define the path to the static directory relative to the project root
+# This assumes your 'static' folder is at the same level as 'main.py'
+STATIC_DIR = Path(__file__).parent.parent.parent / "static"
+INDEX_HTML_PATH = STATIC_DIR / "index.html"
+
+
+@router.get(
+    "/",
+    summary="Serve the dashboard's main HTML page",
+    description="Serves the single-page application for the monitoring dashboard.",
+)
+async def get_dashboard_page():
+    """
+    Endpoint to serve the `index.html` file for the dashboard.
+    FastAPI's FileResponse handles sending the file to the client's browser.
+    """
+    if not INDEX_HTML_PATH.is_file():
+        logger.error(f"Dashboard HTML file not found at: {INDEX_HTML_PATH}")
+        return {"error": "Dashboard UI not found"}, 500
+    return FileResponse(INDEX_HTML_PATH)
+
+
+@router.websocket("/ws/dashboard")
+async def websocket_endpoint(
+    websocket: WebSocket,
+    job_manager: JobManager = Depends(get_job_manager),
+):
+    """
+    The main WebSocket endpoint for the dashboard.
+
+    It handles the lifecycle of a client connection, listens for incoming
+    commands from the frontend, and serves as the entry point for broadcasting
+
+    real-time updates.
+    """
+    await websocket_manager.connect(websocket)
+    try:
+        while True:
+            # Wait for a message from the client
+            raw_data = await websocket.receive_text()
+            try:
+                data = json.loads(raw_data)
+                action = data.get("action")
+
+                # Handle the initial request to load all job data
+                if action == "get_all_jobs":
+                    logger.info("Dashboard requested all job statuses.")
+                    all_jobs = await job_manager.get_all_job_statuses()
+                    # Send the job list back to the client
+                    await websocket.send_json({
+                        "type": "all_jobs",
+                        "payload": all_jobs
+                    })
+
+            except json.JSONDecodeError:
+                logger.warning(f"Received invalid JSON via WebSocket: {raw_data}")
+            except Exception as e:
+                logger.error(f"Error processing WebSocket message: {e}", exc_info=True)
+
+    except WebSocketDisconnect:
+        logger.info("Dashboard client disconnected.")
+    finally:
+        # Ensure the connection is removed from the manager on disconnect
+        websocket_manager.disconnect(websocket)
+
+================================================================================
+--- File: graphiti_ingestion/api/dashboard_websockets.py ---
+================================================================================
+
+# graphiti_ingestion/api/dashboard_websockets.py
+
+import asyncio
+import logging
+from typing import List
+import json
+from fastapi import WebSocket
+
+logger = logging.getLogger(__name__)
+
+
+class WebSocketManager:
+    """
+    Manages active WebSocket connections for the dashboard.
+
+    This class provides a centralized way to track all connected clients and
+    broadcast messages to them, such as live log updates or job status changes.
+    """
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+        self.loop = asyncio.get_event_loop()
+
+    async def connect(self, websocket: WebSocket):
+        """Accepts and stores a new WebSocket connection."""
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        logger.info("Dashboard client connected via WebSocket.")
+
+    def disconnect(self, websocket: WebSocket):
+        """Removes a WebSocket connection."""
+        self.active_connections.remove(websocket)
+        logger.info("Dashboard client disconnected.")
+
+    async def broadcast(self, message: str):
+        """Sends a message to all connected clients."""
+        # Create a list of tasks to send messages concurrently
+        tasks = [connection.send_text(message) for connection in self.active_connections]
+        # Wait for all messages to be sent, but don't fail if one client has an issue
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    def broadcast_threadsafe(self, message: str):
+        """
+        Sends a message from a non-async context (like a standard logging thread)
+        by scheduling the broadcast on the main event loop.
+        """
+        asyncio.run_coroutine_threadsafe(self.broadcast(message), self.loop)
+
+
+# --- Create a singleton instance to be used across the application ---
+websocket_manager = WebSocketManager()
+
+
+class WebSocketLogHandler(logging.Handler):
+    """
+    A custom Python logging handler that streams log records over a WebSocket.
+
+    This handler is added to the root logger. Whenever a log message is emitted
+    anywhere in the application, this handler's `emit` method is called. It
+    formats the log record and uses the WebSocketManager to broadcast it to all
+    connected dashboard clients in real-time.
+    """
+    def __init__(self, manager: WebSocketManager):
+        super().__init__()
+        self.manager = manager
+        # Set a professional log format for the dashboard stream
+        formatter = logging.Formatter(
+            '%(asctime)s - %(levelname)-8s - %(name)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        self.setFormatter(formatter)
+
+    def emit(self, record: logging.LogRecord):
+        """
+        Formats the log record and broadcasts it thread-safely.
+        """
+        try:
+            # Format the log record into a string
+            msg = self.format(record)
+            # Create a JSON structure for the frontend to easily parse
+            log_data = {"type": "log", "payload": msg}
+            # Use the thread-safe method to broadcast from the logging thread
+            self.manager.broadcast_threadsafe(json.dumps(log_data))
+        except Exception:
+            # If broadcasting fails, fall back to handling the error locally
+            self.handleError(record)
+
+================================================================================
+--- File: graphiti_ingestion/services/task_queue.py ---
+================================================================================
+
+import asyncio
+from typing import Any, Dict, Optional
+
+
+class TaskQueue:
+    """
+    A simple in-memory, asynchronous task queue and status tracker.
+    
+    This class manages a queue of jobs to be processed and stores the status
+    of each job.
+    """
+
+    def __init__(self):
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.job_statuses: Dict[str, Dict[str, Any]] = {}
+
+    async def submit_job(self, job_id: str, data: Dict[str, Any]):
+        """
+        Adds a new job to the queue and sets its initial status.
+
+        Args:
+            job_id: A unique identifier for the job.
+            data: The payload of the job to be processed.
+        """
+        initial_status = {
+            "job_id": job_id,
+            "status": "pending",
+            "message": "Job is waiting in the queue.",
+        }
+        self.job_statuses[job_id] = initial_status
+        await self.queue.put({"job_id": job_id, "data": data})
+
+    async def get_job_status(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieves the status of a specific job.
+
+        Args:
+            job_id: The unique identifier for the job.
+
+        Returns:
+            A dictionary with the job's status, or None if the job_id is not found.
+        """
+        return self.job_statuses.get(job_id)
+
+    async def get_job(self) -> Dict[str, Any]:
+        """
+        Waits for and retrieves the next job from the queue.
+        This is typically called by a background worker.
+        """
+        return await self.queue.get()
+
+    async def update_job_status(self, job_id: str, status: str, message: Optional[str] = None):
+        """
+        Updates the status and message of a job.
+
+        Args:
+            job_id: The unique identifier for the job.
+            status: The new status (e.g., "processing", "completed", "failed").
+            message: An optional message, useful for error details.
+        """
+        if job_id in self.job_statuses:
+            self.job_statuses[job_id]["status"] = status
+            self.job_statuses[job_id]["message"] = message
+
+    def mark_task_done(self):
+        """
+        Signals that a formerly enqueued task is complete.
+        Called by the worker after processing a job.
+        """
+        self.queue.task_done()
+
+
+# --- Dependency Injection Singleton ---
+# This ensures that the entire application uses the same instance of TaskQueue.
+_task_queue_instance = TaskQueue()
+
+
+def get_task_queue() -> TaskQueue:
+    """
+    FastAPI dependency to get the singleton instance of the TaskQueue.
+    """
+    return _task_queue_instance
+
+================================================================================
+--- File: graphiti_ingestion/services/graphiti_service.py ---
+================================================================================
+
+# graphiti_ingestion/services/graphiti_service.py
+
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+from graphiti_core import Graphiti
+from graphiti_core.llm_client import LLMConfig
+from graphiti_core.nodes import EpisodeType
+
+from graphiti_ingestion.config import Settings, get_settings
+from graphiti_ingestion.embeder.jina_triton_embedder import (
+    JinaV3TritonEmbedder,
+    JinaV3TritonEmbedderConfig,
+)
+from graphiti_ingestion.gemini.client import ManagedGeminiClient
+from graphiti_ingestion.gemini.manager import ComprehensiveManager
+from graphiti_ingestion.gemini.reranker import ManagedGeminiReranker
+
+logger = logging.getLogger(__name__)
+
+
+class GraphitiService:
+    """
+    A service class to manage the Graphiti instance and its dependencies.
+    """
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.graphiti: Graphiti
+        self.jina_embedder: JinaV3TritonEmbedder
+        self.managed_llm_client: ManagedGeminiClient
+        self.managed_reranker: ManagedGeminiReranker
+
+        logger.info("Initializing ComprehensiveManager for Gemini API...")
+        gemini_manager = ComprehensiveManager(
+            api_key_csv_path=self.settings.GEMINI_API_CSV_PATH,
+            model_config_path=self.settings.GEMINI_MODEL_CONFIG,
+            api_key_cooldown_seconds=self.settings.GEMINI_API_KEY_COOLDOWN_SECONDS,
+        )
+
+        logger.info("Initializing ManagedGeminiClient...")
+        self.managed_llm_client = ManagedGeminiClient(
+            manager=gemini_manager,
+            config=LLMConfig(temperature=self.settings.GEMINI_MODEL_TEMPERATURE),
+            global_cooldown_seconds=self.settings.GEMINI_GLOBAL_COOLDOWN_SECONDS,
+        )
+
+        logger.info("Initializing ManagedGeminiReranker...")
+        self.managed_reranker = ManagedGeminiReranker(
+            manager=gemini_manager,
+            config=LLMConfig(model=self.settings.GEMINI_DEFAULT_RERANKER),
+            global_cooldown_seconds=self.settings.GEMINI_GLOBAL_COOLDOWN_SECONDS,
+        )
+
+        logger.info("Initializing Jina Triton Embedder...")
+        jina_config = JinaV3TritonEmbedderConfig(
+            triton_url=self.settings.TRITON_URL
+        )
+        self.jina_embedder = JinaV3TritonEmbedder(config=jina_config)
+
+        logger.info("Initializing Graphiti Core...")
+        self.graphiti = Graphiti(
+            uri=self.settings.NEO4J_URI,
+            user=self.settings.NEO4J_USER,
+            password=self.settings.NEO4J_PASSWORD,
+            llm_client=self.managed_llm_client,
+            embedder=self.jina_embedder,
+            cross_encoder=self.managed_reranker
+        )
+        logger.info("GraphitiService initialized successfully.")
+
+
+    async def startup(self) -> None:
+        """Initializes connections and builds database constraints/indices."""
+        logger.info("Building Graphiti indices and constraints in Neo4j...")
+        await self.graphiti.build_indices_and_constraints()
+        logger.info("Graphiti indices and constraints are set up.")
+
+    async def shutdown(self) -> None:
+        """Closes all connections gracefully."""
+        logger.info("Closing all service connections...")
+        if self.graphiti:
+            await self.graphiti.close()
+        if self.jina_embedder:
+            await self.jina_embedder.close()
+        if self.managed_llm_client:
+            self.managed_llm_client.close()
+            logger.info("ManagedGeminiClient worker has been closed.")
+        if self.managed_reranker:
+            self.managed_reranker.close()
+            logger.info("ManagedGeminiReranker worker has been closed.")
+        logger.info("All services and connections are now closed.")
+
+    async def process_and_add_episode(
+        self, episode_data: Dict[str, Any], retry_count: int = 0
+    ) -> None:
+        """
+        Processes a single episode payload and adds it to the graph.
+        """
+        content = episode_data["content"]
+        episode_type_str = episode_data["type"]
+        description = episode_data["description"]
+        
+        # ---> THIS IS THE CORRECTED LINE <---
+        # The EpisodeType enum in graphiti-core uses lowercase members ('text', 'json').
+        # We remove the `.upper()` to prevent a KeyError.
+        episode_type_enum = EpisodeType[episode_type_str]
+        # ---> END OF CORRECTION <---
+
+        episode_body = json.dumps(content, ensure_ascii=False) if episode_type_enum == EpisodeType.json else content
+        
+        episode_name = f"Ingested Episode - {datetime.now(timezone.utc).isoformat()}"
+
+        logger.info(f"Adding episode '{episode_name}' (Attempt #{retry_count + 1}) to the graph.")
+        
+        try:
+            self.managed_llm_client.set_retry_state(is_retry=retry_count > 0)
+            await self.graphiti.add_episode(
+                name=episode_name,
+                episode_body=episode_body,
+                source=episode_type_enum,
+                source_description=description,
+                reference_time=datetime.now(timezone.utc)
+            )
+            logger.info(f"Successfully added episode '{episode_name}'.")
+        finally:
+            self.managed_llm_client.set_retry_state(is_retry=False)
+
+
+# --- Dependency Injection Singleton ---
+_graphiti_service_instance: Optional[GraphitiService] = None
+
+def get_graphiti_service() -> GraphitiService:
+    """FastAPI dependency to get the singleton GraphitiService instance."""
+    if _graphiti_service_instance is None:
+        raise RuntimeError("GraphitiService has not been initialized.")
+    return _graphiti_service_instance
+
+def initialize_graphiti_service() -> GraphitiService:
+    """Creates and stores the singleton instance of the GraphitiService."""
+    global _graphiti_service_instance
+    if _graphiti_service_instance is None:
+        logger.info("Creating singleton instance of GraphitiService.")
+        settings = get_settings()
+        _graphiti_service_instance = GraphitiService(settings)
+    return _graphiti_service_instance
+
+================================================================================
+--- File: graphiti_ingestion/services/job_manager.py ---
+================================================================================
+
+# graphiti_ingestion/services/job_manager.py
+
+import asyncio
+import json
+import logging
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from ..api.dashboard_websockets import websocket_manager
+from ..config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+class JobStatus:
+    """Provides consistent string constants for job statuses."""
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class JobManager:
+    """
+    Manages ingestion jobs using a file-based queue for persistence.
+
+    This class handles the job lifecycle by moving files between status
+    directories. It now includes logic to track and manage job retries
+    by creating and reading a `.retry.json` metadata file for each job.
+    """
+
+    def __init__(self, base_path: Path):
+        self.base_path = base_path
+        self.paths = {
+            status: self.base_path / status for status in
+            [JobStatus.PENDING, JobStatus.PROCESSING, JobStatus.COMPLETED, JobStatus.FAILED]
+        }
+        self._create_directories()
+
+    def _create_directories(self) -> None:
+        """Ensures all necessary status subdirectories exist on startup."""
+        logger.info(f"Initializing job directories in: {self.base_path}")
+        for path in self.paths.values():
+            path.mkdir(exist_ok=True, parents=True)
+
+    def _get_job_paths(self, job_id: str, status: str) -> Tuple[Path, Path, Path]:
+        """
+        Returns the data, status, and retry file paths for a job in a given state.
+        """
+        dir_path = self.paths[status]
+        return (
+            dir_path / f"{job_id}.json",
+            dir_path / f"{job_id}.status.json",
+            dir_path / f"{job_id}.retry.json",
+        )
+
+    def _broadcast_job_update(self, job_data: Dict[str, Any]) -> None:
+        """Helper to send a real-time job update to all dashboard clients."""
+        message = {"type": "job_update", "payload": job_data}
+        websocket_manager.broadcast_threadsafe(json.dumps(message))
+        logger.debug(f"Broadcasted job update for {job_data.get('job_id')}")
+
+    async def submit_job(self, job_id: str, data: Dict[str, Any]) -> None:
+        """Saves a new job to the 'pending' directory and notifies the dashboard."""
+        job_path, status_path, _ = self._get_job_paths(job_id, JobStatus.PENDING)
+
+        status_info = {
+            "job_id": job_id,
+            "status": JobStatus.PENDING,
+            "message": "Job is waiting in the queue.",
+            "submitted_at": datetime.now(timezone.utc).isoformat(),
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "retry_count": 0,
+        }
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, job_path.write_text, json.dumps(data, indent=2, ensure_ascii=False))
+        await loop.run_in_executor(None, status_path.write_text, json.dumps(status_info, indent=2, ensure_ascii=False))
+        
+        logger.info(f"Submitted job {job_id} to the pending queue.")
+        self._broadcast_job_update(status_info)
+
+    async def get_job_status(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Finds and reads the status file for a single job by its ID."""
+        for status in self.paths.keys():
+            _, status_path, _ = self._get_job_paths(job_id, status)
+            if status_path.exists():
+                loop = asyncio.get_running_loop()
+                content = await loop.run_in_executor(None, status_path.read_text)
+                return json.loads(content)
+        return None
+
+    async def get_all_job_statuses(self) -> List[Dict[str, Any]]:
+        """Scans all directories for the dashboard's initial data load."""
+        all_jobs = []
+        loop = asyncio.get_running_loop()
+
+        for path in self.paths.values():
+            for status_file in path.glob("*.status.json"):
+                try:
+                    content = await loop.run_in_executor(None, status_file.read_text)
+                    job_data = json.loads(content)
+                    if job_data.get("status") == JobStatus.COMPLETED:
+                        submitted = datetime.fromisoformat(job_data["submitted_at"])
+                        completed = datetime.fromisoformat(job_data["last_updated"])
+                        job_data["processing_time_seconds"] = round((completed - submitted).total_seconds(), 2)
+                    all_jobs.append(job_data)
+                except Exception as e:
+                    logger.error(f"Could not parse status file {status_file}: {e}")
+
+        all_jobs.sort(key=lambda j: j.get("submitted_at", ""), reverse=True)
+        return all_jobs
+
+    async def get_next_job(self) -> Optional[Tuple[str, Dict[str, Any], int]]:
+        """
+        Finds the oldest pending job, moves it to 'processing', and returns its data.
+        Prioritizes non-retried jobs over retried ones.
+        """
+        pending_path = self.paths[JobStatus.PENDING]
+        job_files = [f for f in pending_path.glob("*.json") if ".status" not in f.name]
+        if not job_files:
+            return None
+
+        non_retried = [p for p in job_files if not (p.parent / f"{p.stem}.retry.json").exists()]
+        target_path = min(non_retried, key=os.path.getctime) if non_retried else min(job_files, key=os.path.getctime)
+        job_id = target_path.stem
+
+        loop = asyncio.get_running_loop()
+        _, _, pending_retry_path = self._get_job_paths(job_id, JobStatus.PENDING)
+        retry_count = 0
+        if pending_retry_path.exists():
+            try:
+                content = await loop.run_in_executor(None, pending_retry_path.read_text)
+                retry_count = json.loads(content).get("retry_count", 0)
+            except Exception:
+                logger.error(f"Could not read retry file for {job_id}, assuming 0.", exc_info=True)
+
+        processing_job_path, proc_status_path, proc_retry_path = self._get_job_paths(job_id, JobStatus.PROCESSING)
+        try:
+            await loop.run_in_executor(None, lambda: target_path.rename(processing_job_path))
+            # Move associated metadata files
+            for src_suffix, dest_path in [
+                (".status.json", proc_status_path),
+                (".retry.json", proc_retry_path)
+            ]:
+                src_path = pending_path / (job_id + src_suffix)
+                if src_path.exists():
+                    await loop.run_in_executor(None, lambda: src_path.rename(dest_path))
+        except FileNotFoundError:
+            logger.warning(f"Job {job_id} was moved by another process. Skipping.")
+            return None
+
+        await self.update_job_status(job_id, JobStatus.PROCESSING, f"Worker processing (Attempt #{retry_count + 1}).", retry_count)
+        content = await loop.run_in_executor(None, processing_job_path.read_text)
+        return job_id, json.loads(content), retry_count
+
+    async def requeue_job_for_retry(self, job_id: str, new_retry_count: int, message: str) -> None:
+        """Moves a job back to the pending queue and updates its retry count."""
+        status_info = await self.get_job_status(job_id)
+        if not status_info:
+            return
+        
+        current_status = status_info["status"]
+        paths = {s: self._get_job_paths(job_id, s) for s in [current_status, JobStatus.PENDING]}
+        loop = asyncio.get_running_loop()
+
+        for i in range(3): # Move data, status, and retry files
+            if paths[current_status][i].exists():
+                await loop.run_in_executor(None, lambda: paths[current_status][i].rename(paths[JobStatus.PENDING][i]))
+        
+        retry_data = {"retry_count": new_retry_count, "last_failure_reason": message}
+        await loop.run_in_executor(None, paths[JobStatus.PENDING][2].write_text, json.dumps(retry_data))
+        
+        await self.update_job_status(job_id, JobStatus.PENDING, message, new_retry_count)
+
+    async def update_job_status(
+        self, job_id: str, new_status: str, message: Optional[str] = None, retry_count: Optional[int] = None
+    ) -> None:
+        """Updates a job's status file, moves its files, and notifies the dashboard."""
+        status_info = await self.get_job_status(job_id)
+        if not status_info:
+            return
+
+        current_status = status_info["status"]
+        if current_status != new_status:
+            paths = {s: self._get_job_paths(job_id, s) for s in [current_status, new_status]}
+            loop = asyncio.get_running_loop()
+            for i in range(3):
+                 if paths[current_status][i].exists():
+                    await loop.run_in_executor(None, lambda: paths[current_status][i].rename(paths[new_status][i]))
+
+        _, final_status_path, _ = self._get_job_paths(job_id, new_status)
+        status_info.update({
+            "status": new_status,
+            "last_updated": datetime.now(timezone.utc).isoformat(),
+            "message": message or status_info["message"],
+            "retry_count": retry_count if retry_count is not None else status_info.get("retry_count", 0)
+        })
+
+        if new_status == JobStatus.COMPLETED:
+            submitted = datetime.fromisoformat(status_info["submitted_at"])
+            completed = datetime.fromisoformat(status_info["last_updated"])
+            status_info["processing_time_seconds"] = round((completed - submitted).total_seconds(), 2)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, final_status_path.write_text, json.dumps(status_info, indent=2, ensure_ascii=False))
+        
+        logger.info(f"Updated job {job_id} to status '{new_status}'.")
+        self._broadcast_job_update(status_info)
+
+
+# --- Dependency Injection Singleton ---
+_job_manager_instance: Optional[JobManager] = None
+
+def get_job_manager() -> JobManager:
+    """FastAPI dependency to get the singleton JobManager instance."""
+    global _job_manager_instance
+    if _job_manager_instance is None:
+        logger.info("Creating singleton instance of JobManager.")
+        settings = get_settings()
+        _job_manager_instance = JobManager(base_path=settings.JOB_QUEUE_PATH)
+    return _job_manager_instance
+
+================================================================================
+--- File: graphiti_ingestion/gemini/worker.py ---
+================================================================================
+
+# graphiti_ingestion/gemini/worker.py
+
+from __future__ import annotations
+
+import queue
+import random
+import threading
+import time
+from typing import Any, Iterable, List, Optional, Tuple
+
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
+
+from graphiti_ingestion.gemini.manager import ComprehensiveManager, TaskType
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+def _to_contents(messages: Iterable[Any]) -> List[types.Content]:
+    """
+    Converts a list of Pydantic `Message` objects into the google-genai SDK's
+    `types.Content` objects.
+
+    Args:
+        messages: An iterable of `graphiti_core.prompts.models.Message` objects.
+
+    Returns:
+        A list of `types.Content` objects ready for the API.
+    """
+    out: List[types.Content] = []
+    for m in messages:
+        # ---> THIS IS THE CORRECTED LOGIC <---
+        # Access attributes directly on the 'Message' object (m.role)
+        # instead of treating it like a dictionary (m.get("role")).
+        role = m.role if hasattr(m, "role") else "user"
+        if role == "assistant":
+            role = "model"
+        
+        content = m.content if hasattr(m, "content") else ""
+        if content is None:
+            content = ""
+        # ---> END OF CORRECTION <---
+
+        out.append(types.Content(role=role, parts=[types.Part(text=content)]))
+    return out
+
+
+def _is_retryable_exception(exc: BaseException) -> Tuple[bool, Optional[int]]:
+    """
+    Determines if an exception is retryable.
+    """
+    if isinstance(exc, genai_errors.ServerError):
+        return True, getattr(exc, 'code', 500)
+    if isinstance(exc, genai_errors.ClientError):
+        return getattr(exc, 'code', 400) == 429, getattr(exc, 'code', 400)
+    msg = str(exc).lower()
+    if any(h in msg for h in ("timeout", "connection reset", "unavailable")):
+        return True, None
+    return False, None
+
+
+class GeminiAPIWorker(threading.Thread):
+    """
+    A dedicated, synchronous worker that processes API requests one at a time.
+    """
+
+    def __init__(
+        self,
+        manager: ComprehensiveManager,
+        work_queue: queue.Queue,
+        delay_between_calls: float = 1.0,
+        max_attempts: int = 5,
+        base_backoff: float = 1.0,
+        max_backoff: float = 10.0,
+    ):
+        super().__init__(daemon=True)
+        self.manager = manager
+        self.work_queue = work_queue
+        self.delay_between_calls = delay_between_calls
+        self.max_attempts = max_attempts
+        self.base_backoff = base_backoff
+        self.max_backoff = max_backoff
+
+    def _sleep_with_jitter(self, attempt_idx: int) -> None:
+        """Pauses execution using a linear backoff strategy with random jitter."""
+        backoff = min(self.max_backoff, self.base_backoff * (attempt_idx + 1))
+        time.sleep(backoff * (0.5 + random.random()))
+
+    def run(self) -> None:
+        """The main loop of the worker thread."""
+        logger.info("Synchronous Gemini API Worker has started.")
+        while True:
+            job = None
+            try:
+                job = self.work_queue.get()
+                if job is None:
+                    break  # Shutdown signal
+
+                original_messages, gen_config, future, loop, retry_count = job
+                
+                force_best = retry_count > 0
+                if force_best:
+                    logger.warning(f"Retry attempt #{retry_count + 1}. Forcing best model.")
+                
+                client_generator = self.manager.get_available_client_details(
+                    TaskType.TEXT_TO_TEXT, 
+                    force_best_model=force_best
+                )
+
+                contents = _to_contents(original_messages)
+                last_exc: Optional[BaseException] = None
+
+                for attempt in range(self.max_attempts):
+                    api_key, model_name = next(client_generator)
+                    logger.info(f"WORKER: Attempt {attempt + 1}/{self.max_attempts} with key …{api_key[-4:]} on model '{model_name}'")
+                    
+                    try:
+                        model_cfg = self.manager.get_model_config(model_name)
+                        if model_cfg:
+                            token_limit = model_cfg.get("tokens", {}).get("output_limit", 8192)
+                            gen_config['max_output_tokens'] = token_limit
+                            logger.info(f"Set max_output_tokens to {token_limit} for {model_name}.")
+
+                        client = genai.Client(api_key=api_key)
+                        safety_settings = {'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE', 'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE', 'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'BLOCK_NONE', 'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'}
+                        
+                        response = client.models.generate_content(
+                            model=model_name, 
+                            contents=contents, 
+                            generation_config=types.GenerationConfig(**gen_config),
+                            safety_settings=safety_settings
+                        )
+                        self.manager.mark_key_cooldown(api_key)
+
+                        if not getattr(response, "text", None):
+                            logger.error(f"WORKER: API returned 200 OK but response was empty. Full Response: {response}")
+
+                        loop.call_soon_threadsafe(future.set_result, (response, model_name))
+                        last_exc = None
+                        break
+                    except Exception as e:
+                        last_exc = e
+                        retryable, status = _is_retryable_exception(e)
+                        if retryable:
+                            logger.warning(f"WORKER: Retryable error (HTTP {status}) with key …{api_key[-4:]}. Retrying.")
+                            self._sleep_with_jitter(attempt)
+                        else:
+                            logger.error(f"WORKER: Non-retryable error: {e}", exc_info=True)
+                            loop.call_soon_threadsafe(future.set_exception, e)
+                            break
+                else:
+                    err = Exception(f"Failed after {self.max_attempts} attempts. Last error: {last_exc}")
+                    logger.error(f"WORKER: Exhausted all retries. Last error: {last_exc}")
+                    loop.call_soon_threadsafe(future.set_exception, err)
+            except Exception as e:
+                logger.critical(f"Critical error in Gemini worker loop: {e}", exc_info=True)
+                if 'future' in locals() and not future.done():
+                    loop.call_soon_threadsafe(future.set_exception, e)
+            finally:
+                if job:
+                    self.work_queue.task_done()
+                time.sleep(self.delay_between_calls)
+        logger.info("Synchronous Gemini API Worker is shutting down.")
+
+================================================================================
+--- File: graphiti_ingestion/gemini/client.py ---
+================================================================================
+
+# graphiti_ingestion/gemini/client.py
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import queue
+from asyncio import Future
+from typing import Any, Dict, List, Tuple
+
+from google.genai import types
+from pydantic import BaseModel
+
+from graphiti_core.llm_client.client import LLMClient
+from graphiti_core.llm_client.config import LLMConfig, ModelSize
+from graphiti_core.llm_client.gemini_client import (
+    MULTILINGUAL_EXTRACTION_RESPONSES,
+)
+from graphiti_core.prompts.models import Message
+
+from .manager import ComprehensiveManager
+from .worker import GeminiAPIWorker
+
+logger = logging.getLogger(__name__)
+
+
+class ManagedGeminiClient(LLMClient):
+    """
+    An async-safe Gemini client compatible with `graphiti-core`.
+
+    This client offloads all API calls to a dedicated synchronous worker thread.
+    This ensures strict, sequential execution to manage rate limits and API key
+    rotation effectively. It uses an internal state variable (`_is_retry_request`)
+    as a "side channel" to communicate retry attempts to the worker, a workaround
+    for `graphiti-core`'s inability to pass custom arguments.
+    """
+
+    def __init__(
+        self,
+        manager: ComprehensiveManager,
+        config: LLMConfig | None = None,
+        cache: bool = False,
+        global_cooldown_seconds: float = 1.0,
+    ):
+        super().__init__(config or LLMConfig(), cache)
+        self.manager = manager
+        self.config = config or LLMConfig()
+        self._work_queue: queue.Queue = queue.Queue()
+        self._worker = GeminiAPIWorker(
+            manager=self.manager,
+            work_queue=self._work_queue,
+            delay_between_calls=global_cooldown_seconds,
+        )
+        self._worker.start()
+
+        # Internal state to signal a retry attempt to the worker
+        self._is_retry_request: bool = False
+
+        logger.info("ManagedGeminiClient initialized and worker thread started.")
+
+    def set_retry_state(self, is_retry: bool) -> None:
+        """
+        Sets the retry state for the NEXT `generate_response` call.
+
+        This is a workaround for `graphiti-core`'s lack of custom arg passing.
+        It should be called by the service layer immediately before a call
+        to `graphiti.add_episode` that is known to be a retry.
+
+        Args:
+            is_retry: True if the next request should use the retry logic.
+        """
+        self._is_retry_request = is_retry
+
+    def close(self) -> None:
+        """Shuts down the worker thread cleanly."""
+        if self._worker.is_alive():
+            self._work_queue.put(None)
+            self._worker.join(timeout=5.0)  # Prevent hanging on shutdown
+            logger.info("ManagedGeminiClient worker has been closed.")
+
+    async def _execute_job(
+        self,
+        messages: List[Message],
+        gen_config: Dict[str, Any],
+        retry_count: int,
+    ) -> Tuple[types.GenerateContentResponse, str]:
+        """
+        Submits a job to the worker's queue and awaits the result.
+
+        Args:
+            messages: The list of messages for the prompt.
+            gen_config: The generation configuration dictionary.
+            retry_count: The number of times this job has been attempted.
+
+        Returns:
+            A tuple containing the API response and the name of the model used.
+        """
+        loop = asyncio.get_running_loop()
+        future: Future = loop.create_future()
+        # The job tuple now includes the retry_count for the worker
+        self._work_queue.put((messages, gen_config, future, loop, retry_count))
+        return await future
+
+    async def _generate_response(
+        self,
+        messages: List[Message],
+        response_model: type[BaseModel] | None = None,
+        max_tokens: int | None = None,
+        model_size: ModelSize = ModelSize.medium,
+    ) -> Dict[str, Any]:
+        """
+        Prepares the request, passes the current retry state to the worker,
+        and parses the final response.
+        """
+        system_prompt = ""
+        if messages and messages[0].role == "system":
+            system_prompt = messages[0].content or ""
+            messages = messages[1:]
+
+        # Base generation config. The worker will override max_output_tokens.
+        generation_config = {
+            "temperature": self.config.temperature,
+            "max_output_tokens": max_tokens or 8192,
+            "response_mime_type": "application/json" if response_model else "text/plain",
+            "response_schema": (
+                response_model.model_json_schema() if response_model else None
+            ),
+        }
+        # The google-genai library expects system_instruction to be a top-level
+        # argument to generate_content, not part of the config dict.
+        # However, our worker's signature is generic. We will handle this there.
+        # For now, let's keep it simple. The worker will handle passing it correctly.
+        # Our `_to_contents` function handles system prompts now.
+
+        try:
+            retry_count_for_worker = 1 if self._is_retry_request else 0
+            response, used_model = await self._execute_job(
+                messages, generation_config, retry_count_for_worker
+            )
+        except Exception as e:
+            logger.error(f"ManagedGeminiClient: job failed in worker: {e}")
+            raise
+
+        raw_output = getattr(response, "text", None)
+
+        if not raw_output:
+            raise ValueError(
+                f"Model {used_model} returned no text. This could be due to "
+                f"safety filters or other limits. Full response: {response}"
+            )
+
+        if response_model:
+            try:
+                validated = response_model.model_validate_json(raw_output)
+                return validated.model_dump()
+            except Exception as e:
+                logger.error(f"Failed to parse JSON from model {used_model}. Raw output: {raw_output}")
+                raise ValueError(f"Failed to parse structured JSON from {used_model}: {e}") from e
+
+        return {"content": raw_output}
+
+    async def generate_response(
+        self,
+        messages: List[Message],
+        response_model: type[BaseModel] | None = None,
+        max_tokens: int | None = None,
+        model_size: ModelSize = ModelSize.medium,
+        **kwargs, # Accept and ignore any other keyword arguments
+    ) -> Dict[str, Any]:
+        """
+        Public entrypoint for `graphiti-core`.
+
+        This method relies on the `_is_retry_request` internal state, which
+        must be set via `set_retry_state()` before this method is called.
+        """
+        if messages and messages[0].content:
+            messages[0].content += MULTILINGUAL_EXTRACTION_RESPONSES
+
+        return await self._generate_response(
+            messages=messages,
+            response_model=response_model,
+            max_tokens=max_tokens,
+            model_size=model_size,
+        )
+
+================================================================================
+--- File: graphiti_ingestion/gemini/reranker.py ---
+================================================================================
+
+# managed_gemini_reranker.py
+
+from __future__ import annotations
+
+import asyncio
+import json
+import queue
+import typing
+from asyncio import Future
+
+from google.genai import types
+from pydantic import BaseModel, Field
+
+# --- Local Project Imports ---
+from graphiti_ingestion.gemini.manager import ComprehensiveManager
+from graphiti_ingestion.gemini.worker import GeminiAPIWorker
+
+# --- Graphiti Core Imports ---
+from graphiti_core.cross_encoder.client import CrossEncoderClient # CORRECT IMPORT
+from graphiti_core.llm_client.config import LLMConfig
+from graphiti_core.prompts.models import Message
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+# Define the expected JSON structure for the LLM response.
+class RerankedDocument(BaseModel):
+    """Represents a single document with its relevance score."""
+    document: str
+    relevance_score: float = Field(
+        ...,
+        description="A score from 0.0 to 1.0 indicating relevance.",
+        ge=0.0,
+        le=1.0,
+    )
+
+class RerankResponse(BaseModel):
+    """The root model for the reranking JSON response."""
+    reranked_documents: list[RerankedDocument]
+
+
+# CORRECTED CLASS DEFINITION: Inherits from CrossEncoderClient
+class ManagedGeminiReranker(CrossEncoderClient):
+    """
+    A Graphiti-compatible cross-encoder that uses a managed, sequential Gemini
+    worker for robust, rate-limit-aware reranking.
+    """
+
+    def __init__(
+        self,
+        manager: ComprehensiveManager,
+        config: LLMConfig | None = None,
+        global_cooldown_seconds: float = 1.0,
+    ):
+        self.manager = manager
+        self.config = config or LLMConfig()
+
+        self._work_queue: queue.Queue = queue.Queue()
+        self._worker = GeminiAPIWorker(
+            manager=self.manager,
+            work_queue=self._work_queue,
+            delay_between_calls=global_cooldown_seconds
+        )
+        self._worker.start()
+        logger.info("ManagedGeminiReranker worker thread started.")
+
+    def close(self) -> None:
+        """Gracefully stop the reranker worker."""
+        if self._worker.is_alive():
+            self._work_queue.put(None)
+            self._worker.join()
+            logger.info("ManagedGeminiReranker worker has been closed.")
+
+    async def _execute_job(
+        self,
+        messages: list[Message],
+        gen_config: types.GenerateContentConfig
+    ) -> tuple[types.GenerateContentResponse, str]:
+        loop = asyncio.get_running_loop()
+        future: Future = loop.create_future()
+        self._work_queue.put((messages, gen_config, future, loop))
+        return await future
+
+    # CORRECTED METHOD: Renamed to `rank` with the required signature.
+    async def rank(self, query: str, passages: list[str]) -> list[tuple[str, float]]:
+        """
+        Reranks passages for a query using a single, structured call to the Gemini API.
+
+        This method implements the abstract method from CrossEncoderClient.
+        """
+        if not passages:
+            return []
+        if len(passages) == 1:
+            return [(passages[0], 1.0)]
+
+        # Updated instruction to request a specific JSON format.
+        instruction = (
+            "You are an expert reranker. Given a query and a list of documents, "
+            "you must reorder the documents from most to least relevant to the query. "
+            "Provide a relevance score between 0.0 and 1.0 for each document. "
+            f"Your output MUST be a valid JSON object matching this schema: {RerankResponse.model_json_schema()}"
+        )
+
+        system_msg = Message(role="system", content=instruction)
+        user_msg = Message(
+            role="user",
+            content=json.dumps({"query": query, "documents": passages}, ensure_ascii=False)
+        )
+        messages = [system_msg, user_msg]
+
+        generation_config = types.GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=8192,
+            response_mime_type="application/json",
+            # --- THIS IS THE CORRECTED LINE ---
+            response_schema=RerankResponse.model_json_schema(),
+            # --- END OF CORRECTION ---
+        )
+
+        try:
+            # The _execute_job will return a dictionary pre-validated against RerankResponse
+            response_dict = await self._execute_job_with_model(messages, generation_config)
+
+            # Transform the dictionary into the required list[tuple[str, float]] format
+            results = [
+                (item['document'], item['relevance_score'])
+                for item in response_dict.get('reranked_documents', [])
+            ]
+            return results
+
+        except Exception as e:
+            logger.error(f"ManagedGeminiReranker failed during rank: {e}")
+            # As a fallback, return the original passages with a neutral score
+            return [(p, 0.5) for p in passages]
+
+    async def _execute_job_with_model(
+        self, messages: list[Message], gen_config: types.GenerateContentConfig
+    ) -> dict[str, typing.Any]:
+        """Helper to execute job and parse with the internal Pydantic model."""
+        try:
+            response, used_model = await self._execute_job(messages, gen_config)
+        except Exception as e:
+            logger.error(f"ManagedGeminiReranker: job failed in worker: {e}")
+            raise
+
+        raw_output = getattr(response, "text", None)
+        if not raw_output:
+            raise ValueError(f"Model {used_model} returned no text for reranking.")
+        try:
+            # The API should already return validated JSON, but we re-validate for safety.
+            validated = RerankResponse.model_validate(json.loads(raw_output))
+            return validated.model_dump()
+        except Exception as e:
+            raise ValueError(
+                f"Failed to parse reranker JSON from model {used_model}: {e}"
+            ) from e
+
+================================================================================
+--- File: graphiti_ingestion/gemini/manager.py ---
+================================================================================
+
+# graphiti_ingestion/gemini/manager.py
+
+from __future__ import annotations
+
+import csv
+import logging
+import threading
+import time
+import yaml
+from collections import defaultdict
+from enum import Enum, auto
+from itertools import cycle
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional,Tuple
+
+logger = logging.getLogger(__name__)
+
+
+class TaskType(Enum):
+    """
+    Represents high-level task categories based on input/output modalities.
+
+    This enumeration provides a type-safe way for services to request a specific
+    capability from the ComprehensiveManager, preventing errors from typos.
+    """
+    TEXT_TO_TEXT = auto()
+    MULTIMODAL_TO_TEXT = auto()
+    TEXT_TO_AUDIO = auto()
+    IMAGE_GENERATION = auto()
+
+
+class ComprehensiveManager:
+    """
+    Central controller for Gemini API usage.
+
+    This thread-safe class handles:
+      - Loading and cycling through multiple API keys from a CSV.
+      - Enforcing a cooldown period on keys after use.
+      - Loading model configurations and capabilities from a YAML file.
+      - Intelligently selecting models for tasks, with a special mode to
+        force the most capable model for retry attempts.
+    """
+
+    def __init__(
+        self,
+        api_key_csv_path: str,
+        model_config_path: str,
+        api_key_cooldown_seconds: float = 60.0,
+    ):
+        self._lock = threading.Lock()
+        self.api_keys: List[str] = self._load_api_keys(api_key_csv_path)
+        self.models_config: Dict[str, Any] = self._load_model_config(model_config_path)
+        self.api_key_cooldown_seconds: float = api_key_cooldown_seconds
+
+        # Cooldown tracking for API keys
+        self.cooldowns: Dict[str, float] = {}
+
+        # Round-robin generator for cycling through (api_key, model_name) pairs
+        self._client_cycle: Dict[TaskType, Iterator] = {}
+        self._init_client_generators()
+
+    def _load_api_keys(self, csv_path: str) -> List[str]:
+        """Loads API keys from a CSV file with an 'api' header."""
+        path = Path(csv_path)
+        if not path.exists():
+            raise FileNotFoundError(f"API key CSV not found at: {csv_path}")
+
+        keys: List[str] = []
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if "api" not in (reader.fieldnames or []):
+                raise ValueError(f"CSV file '{csv_path}' must have an 'api' header.")
+            for row in reader:
+                key = row.get("api", "").strip()
+                if key:
+                    keys.append(key)
+        if not keys:
+            raise ValueError(f"No API keys found in '{csv_path}'.")
+        logger.info(f"Loaded {len(keys)} API keys.")
+        return keys
+
+    def _load_model_config(self, yaml_path: str) -> Dict[str, Any]:
+        """Loads model definitions and task mappings from a YAML file."""
+        path = Path(yaml_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Model config YAML not found at: {yaml_path}")
+        with open(path, encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        logger.info("Model configuration loaded successfully.")
+        return config
+
+    def _init_client_generators(self) -> None:
+        """Pre-builds the round-robin iterators for each TaskType."""
+        tasks = self.models_config.get("tasks", {})
+        for task_name, task_info in tasks.items():
+            try:
+                task_enum = TaskType[task_name]
+                models = task_info.get("models", [])
+                if models:
+                    clients = [(k, m) for k in self.api_keys for m in models]
+                    self._client_cycle[task_enum] = cycle(clients)
+            except KeyError:
+                logger.warning(f"Task type '{task_name}' in YAML config is not a valid TaskType enum member.")
+
+    def get_model_config(self, model_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieves the full configuration dictionary for a specific model.
+        
+        Args:
+            model_name: The name of the model (e.g., 'gemini-2.5-flash').
+
+        Returns:
+            A dictionary of the model's configuration or None if not found.
+        """
+        return self.models_config.get("models", {}).get(model_name)
+
+    def get_available_client_details(
+        self,
+        task_type: TaskType,
+        force_best_model: bool = False,
+    ) -> Iterator[Tuple[str, str]]:
+        """
+        Yields (API key, model name) pairs, skipping keys on cooldown.
+
+        On a retry, this can be forced to use only the most capable model.
+
+        Args:
+            task_type: The category of task to perform (e.g., TEXT_TO_TEXT).
+            force_best_model: If True, ignores the normal model rotation and
+                              yields only the highest-tier model for the task.
+
+        Yields:
+            A tuple containing a valid, off-cooldown API key and a model name.
+            
+        Raises:
+            RuntimeError: If all available API keys are on cooldown.
+        """
+        if task_type not in self._client_cycle:
+            raise ValueError(f"No model mapping found for task: {task_type}")
+
+        client_generator: Iterator[Tuple[str, str]]
+
+        if force_best_model:
+            tasks = self.models_config.get("tasks", {})
+            model_list = tasks.get(task_type.name, {}).get("models", [])
+            # By convention, the "best" (most capable) model is last in the list
+            best_model = model_list[-1] if model_list else None
+            if not best_model:
+                raise ValueError(f"Could not determine the best model for task {task_type.name}")
+            
+            logger.info(f"Forcing best model for retry: {best_model}")
+            clients = [(key, best_model) for key in self.api_keys]
+            client_generator = cycle(clients)
+        else:
+            client_generator = self._client_cycle[task_type]
+        
+        max_checks = len(self.api_keys) * 5 # Prevent potential infinite loops
+        for _ in range(max_checks):
+            api_key, model_name = next(client_generator)
+            if not self._is_on_cooldown(api_key):
+                yield api_key, model_name
+            else:
+                # Briefly yield control to prevent a tight, CPU-bound loop
+                time.sleep(0.01)
+        
+        raise RuntimeError("All available API keys are currently on cooldown. Please wait or add more keys.")
+
+    def _is_on_cooldown(self, api_key: str) -> bool:
+        """Checks if a given API key is currently in its cooldown period."""
+        return time.time() < self.cooldowns.get(api_key, 0)
+
+    def mark_key_cooldown(self, api_key: str) -> None:
+        """
+        Marks a key as used, putting it on cooldown for the configured duration.
+        This is a thread-safe operation.
+        """
+        with self._lock:
+            self.cooldowns[api_key] = time.time() + self.api_key_cooldown_seconds
+            logger.debug(f"Cooldown set for key ...{api_key[-4:]} for {self.api_key_cooldown_seconds}s")
+
+================================================================================
+--- File: graphiti_ingestion/models/episodes.py ---
+================================================================================
+
+from enum import Enum
+from typing import Dict, Union, Optional
+
+from pydantic import BaseModel, Field
+
+
+class EpisodeContentType(str, Enum):
+    """Enumeration for the type of episode content."""
+    TEXT = "text"
+    JSON = "json"
+
+
+class EpisodeRequest(BaseModel):
+    """
+    Defines the structure for an incoming episode ingestion request.
+    """
+    content: Union[str, Dict] = Field(
+        ...,  # ... means this field is required
+        description="The main content of the episode. Can be a string for text episodes or a JSON object for structured data.",
+        examples=[
+            "Kamala Harris was the Attorney General of California.",
+            {"name": "Gavin Newsom", "position": "Governor"},
+        ],
+    )
+    type: EpisodeContentType = Field(
+        ...,
+        description="The type of the content, either 'text' or 'json'.",
+        examples=["text"],
+    )
+    description: str = Field(
+        ...,
+        description="A brief description of the episode's source or context.",
+        examples=["podcast transcript"],
+    )
+
+
+class EpisodeResponse(BaseModel):
+    """
+
+    Defines the response sent back to the client after successfully submitting an episode.
+    """
+    job_id: str = Field(description="The unique identifier for the processing job.")
+    status: str = Field(description="The initial status of the job, typically 'pending'.")
+    message: str = Field(description="A confirmation message.")
+
+
+class JobStatusResponse(BaseModel):
+    """
+    Defines the structure for a job status query response.
+    """
+    job_id: str = Field(description="The unique identifier for the processing job.")
+    status: str = Field(
+        description="The current status of the job (e.g., pending, processing, completed, failed)."
+    )
+    message: Optional[str] = Field(
+        None,
+        description="An optional message, often used to provide details on failures."
+    )
+
+================================================================================
+--- File: graphiti_ingestion/embeder/jina_triton_embedder.py ---
+================================================================================
+
+# graphiti_ingestion/core/jina_triton_embedder.py
+
+import asyncio
+import json
+import logging
+from typing import Any, Dict, List, Optional, Union
+
+import aiohttp
+import numpy as np
+from graphiti_core.embedder.client import EmbedderClient, EmbedderConfig
+from pydantic import Field
+from transformers import AutoTokenizer
+
+logger = logging.getLogger(__name__)
+
+
+class JinaV3TritonEmbedderConfig(EmbedderConfig):
+    """Configuration for the JinaV3TritonEmbedder."""
+
+    triton_url: str = Field(
+        description="Base URL for the Triton Inference Server"
+    )
+    triton_request_timeout: int = Field(
+        default=60, description="Request timeout in seconds for connecting to Triton."
+    )
+    query_model_name: str = Field(
+        default="jina_query", description="Name of the query embedding model in Triton."
+    )
+    passage_model_name: str = Field(
+        default="jina_passage",
+        description="Name of the passage/document embedding model in Triton.",
+    )
+    tokenizer_name: str = Field(
+        default="jinaai/jina-embeddings-v3",
+        description="Hugging Face tokenizer name for Jina V3.",
+    )
+    triton_output_name: str = Field(
+        default="text_embeds",
+        description="The name of the output tensor from the Triton model.",
+    )
+    batch_size: int = Field(
+        default=4,
+        description="Number of texts to process in a single batch request to Triton.",
+    )
+
+
+class JinaV3TritonEmbedder(EmbedderClient):
+    """
+    An async embedder client for Jina V3 models on Triton, compatible with graphiti-core.
+    """
+
+    def __init__(
+        self,
+        config: JinaV3TritonEmbedderConfig,
+        client_session: Optional[aiohttp.ClientSession] = None,
+    ):
+        super().__init__()
+        self.config = config
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.config.tokenizer_name, trust_remote_code=True
+            )
+        except Exception as e:
+            logger.critical(f"Failed to load Hugging Face tokenizer '{self.config.tokenizer_name}'. Error: {e}")
+            raise
+
+        self._client_session = client_session
+        self._owns_session = client_session is None
+        logger.info(f"JinaV3TritonEmbedder configured for Triton at {self.config.triton_url}")
+
+    @property
+    async def client_session(self) -> aiohttp.ClientSession:
+        if self._client_session is None:
+            self._client_session = aiohttp.ClientSession()
+        return self._client_session
+
+    def _build_triton_payload(
+        self, input_ids: np.ndarray, attention_mask: np.ndarray
+    ) -> Dict[str, Any]:
+        """Constructs the JSON payload for Triton."""
+        return {
+            "inputs": [
+                {
+                    "name": "input_ids",
+                    "shape": list(input_ids.shape),
+                    "datatype": "INT64",
+                    "data": input_ids.flatten().tolist(),
+                },
+                {
+                    "name": "attention_mask",
+                    "shape": list(attention_mask.shape),
+                    "datatype": "INT64",
+                    "data": attention_mask.flatten().tolist(),
+                },
+            ],
+            "outputs": [{"name": self.config.triton_output_name}],
+        }
+
+    async def _embed_batch(
+        self, texts: List[str], model_name: str
+    ) -> List[List[float]]:
+        """Asynchronously tokenizes, sends a request to Triton, and post-processes a single batch."""
+        if not texts:
+            return []
+
+        api_url = f"{str(self.config.triton_url).rstrip('/')}/v2/models/{model_name}/infer"
+        tokens = self.tokenizer(
+            texts, padding=True, truncation=True, max_length=8192, return_tensors="np"
+        )
+        payload = self._build_triton_payload(
+            tokens["input_ids"].astype(np.int64),
+            tokens["attention_mask"].astype(np.int64),
+        )
+        session = await self.client_session
+        timeout = aiohttp.ClientTimeout(total=self.config.triton_request_timeout)
+
+        try:
+            async with session.post(api_url, data=json.dumps(payload), timeout=timeout) as response:
+                response.raise_for_status()
+                response_json = await response.json()
+
+            output_data = next(
+                (out for out in response_json["outputs"] if out["name"] == self.config.triton_output_name),
+                None,
+            )
+            if output_data is None:
+                raise ValueError(f"Triton response did not contain '{self.config.triton_output_name}' output.")
+
+            shape = output_data["shape"]
+            last_hidden_state = np.array(output_data["data"], dtype=np.float32).reshape(shape)
+            
+            # Perform mean pooling and L2 normalization (correct logic from your test script)
+            attention_mask = tokens["attention_mask"]
+            input_mask_expanded = np.expand_dims(attention_mask, -1)
+            sum_embeddings = np.sum(last_hidden_state * input_mask_expanded, 1)
+            sum_mask = np.maximum(input_mask_expanded.sum(1), 1e-9)
+            pooled_embeddings = sum_embeddings / sum_mask
+            normalized_embeddings = pooled_embeddings / np.linalg.norm(
+                pooled_embeddings, ord=2, axis=1, keepdims=True
+            )
+            return normalized_embeddings.tolist()
+
+        except asyncio.TimeoutError:
+            logger.error(f"TimeoutError: Request to Triton at {api_url} timed out after {self.config.triton_request_timeout} seconds.")
+            raise
+        except aiohttp.ClientConnectorError as e:
+            logger.error(f"ClientConnectorError: Could not connect to Triton at {api_url}. Is the URL correct and the server reachable from this machine? Error: {e}")
+            raise
+        except aiohttp.ClientResponseError as e:
+            error_body = await e.response.text()
+            logger.error(f"HTTP Error {e.status} from Triton: {e.message}. Response: {error_body}")
+            raise
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while getting embeddings from Triton at {api_url}.", exc_info=True)
+            raise
+
+    async def create(self, input_data: Union[str, List[str]]) -> List[float]:
+        """Creates an embedding for a single query string using the QUERY model."""
+        text_to_embed = input_data[0] if isinstance(input_data, list) else input_data
+        if not text_to_embed or not isinstance(text_to_embed, str):
+            raise TypeError(f"create() expects a non-empty string, but got {type(input_data)}")
+
+        embeddings = await self._embed_batch([text_to_embed], self.config.query_model_name)
+        if not embeddings:
+            raise ValueError("API returned no embedding for the input.")
+        return embeddings[0]
+
+    async def create_batch(self, input_data_list: List[str]) -> List[List[float]]:
+        """Creates embeddings for a batch of strings using the PASSAGE model."""
+        if not input_data_list:
+            return []
+        all_embeddings = []
+        for i in range(0, len(input_data_list), self.config.batch_size):
+            batch_texts = input_data_list[i : i + self.config.batch_size]
+            batch_embeddings = await self._embed_batch(batch_texts, self.config.passage_model_name)
+            all_embeddings.extend(batch_embeddings)
+        return all_embeddings
+
+    async def close(self):
+        """Closes the underlying aiohttp client session if this instance created it."""
+        if self._client_session and self._owns_session:
+            await self._client_session.close()
+            self._client_session = None
+
+================================================================================
+--- File: configs/gemini.yaml ---
+================================================================================
+
+# ===================================================================
+# Model Definitions
+# ===================================================================
+# This section acts as a database for all available Gemini models.
+# The manager will use this data to enforce rate limits and check capabilities.
+models:
+  gemini-2.5-pro:
+    rpm: 5
+    tpm: 250000
+    rpd: 100
+    inputs: [ "audio", "image", "video", "text", "pdf" ]
+    outputs: [ "text" ]
+    tokens:
+      input_limit: 1048576
+      output_limit: 65536
+    capabilities:
+      thinking: true
+      function_calling: true
+      code_execution: true
+      structured_outputs: true
+      caching: true
+      search_grounding: true
+
+  gemini-2.5-flash:
+    rpm: 10
+    tpm: 250000
+    rpd: 250
+    inputs: [ "text", "image", "video", "audio" ]
+    outputs: [ "text" ]
+    tokens:
+      input_limit: 1048576
+      output_limit: 65536
+    capabilities:
+      thinking: true
+      function_calling: true
+      code_execution: true
+      structured_outputs: true
+      caching: true
+      search_grounding: true
+
+  gemini-2.5-flash-lite:
+    rpm: 15
+    tpm: 250000
+    rpd: 1000
+    inputs: [ "text", "image", "video", "audio", "pdf" ]
+    outputs: [ "text" ]
+    tokens:
+      input_limit: 1048576
+      output_limit: 65536
+    capabilities:
+      thinking: true
+      function_calling: true
+      code_execution: true
+      structured_outputs: true
+      caching: true
+      search_grounding: true
+      url_context: true
+
+  gemini-2.0-flash:
+    rpm: 15
+    tpm: 1000000
+    rpd: 200
+    inputs: [ "audio", "image", "video", "text" ]
+    outputs: [ "text" ]
+    tokens:
+      input_limit: 1048576
+      output_limit: 8192
+    capabilities:
+      thinking: "experimental" # Use string for non-boolean values
+      function_calling: true
+      code_execution: true
+      structured_outputs: true
+      caching: true
+      live_api: true
+      search: true
+
+  gemini-2.0-flash-lite:
+    rpm: 30
+    tpm: 1000000
+    rpd: 200
+    inputs: [ "audio", "image", "video", "text" ]
+    outputs: [ "text" ]
+    tokens:
+      input_limit: 1048576
+      output_limit: 8192
+    capabilities:
+      function_calling: true
+      structured_outputs: true
+      caching: true
+      batch_api: true
+
+  gemini-2.0-flash-preview-image-generation:
+    rpm: 10
+    tpm: 200000
+    rpd: 100
+    inputs: [ "audio", "image", "video", "text" ]
+    outputs: [ "text", "image" ]
+    tokens:
+      input_limit: 32000
+      output_limit: 8192
+    capabilities:
+      image_generation: true
+      structured_outputs: true
+      caching: true
+
+  gemini-2.5-pro-preview-tts:
+    rpm: 3 # Note: More restricted rate limits for TTS models
+    tpm: 10000
+    rpd: 15
+    inputs: [ "text" ]
+    outputs: [ "audio" ]
+    tokens:
+      input_limit: 8000
+      output_limit: 16000 # Output is measured differently for audio
+    capabilities:
+      audio_generation: true
+
+  gemini-2.5-flash-preview-tts:
+    rpm: 3
+    tpm: 10000
+    rpd: 15
+    inputs: [ "text" ]
+    outputs: [ "audio" ]
+    tokens:
+      input_limit: 8000
+      output_limit: 16000
+    capabilities:
+      audio_generation: true
+  
+  # Live API models have unique rate limits (sessions)
+  gemini-live-2.5-flash-preview:
+    rpm: "3 sessions"
+    tpm: 1000000
+    rpd: null # Not specified
+    inputs: ["audio", "video", "text"]
+    outputs: ["text", "audio"]
+    tokens:
+      input_limit: 1048576
+      output_limit: 8192
+    capabilities:
+      audio_generation: true
+      function_calling: true
+      code_execution: true
+      search: true
+      structured_outputs: true
+
+
+# ===================================================================
+# Task Definitions
+# ===================================================================
+# This section maps a high-level task to a prioritized list of models
+# that can perform it. The manager will try models in this order.
+tasks:
+  TEXT_TO_TEXT:
+    description: "For tasks that primarily involve understanding and generating text, like summarization, Q&A, and creative writing."
+    models:
+      - gemini-2.5-flash        # Best price-performance fallback
+      - gemini-2.0-flash          # High throughput fallback
+      - gemini-2.5-flash-lite     # Most cost-efficient fallback
+      - gemini-2.0-flash-lite     # Final cost-efficient option
+      - gemini-2.5-pro            # Highest quality, try first
+      
+
+  MULTIMODAL_TO_TEXT:
+    description: "For tasks that require understanding images, audio, or video to generate a text response."
+    models:
+      - gemini-2.5-pro          # Best multimodal understanding
+      - gemini-2.5-flash        # Strong alternative
+      - gemini-2.0-flash          # Good fallback with large context
+      - gemini-2.5-flash-lite     # Cost-effective option
+
+  TEXT_TO_AUDIO:
+    description: "For generating speech from text (Text-to-Speech)."
+    models:
+      - gemini-2.5-pro-preview-tts   # Highest quality TTS
+      - gemini-2.5-flash-preview-tts # Price-performant TTS
+
+  IMAGE_GENERATION:
+    description: "For generating images from a text prompt."
+    models:
+      - gemini-2.0-flash-preview-image-generation
+
+================================================================================
+--- File: tests/test_api_ingestion.py ---
+================================================================================
+
+# tests/test_api_ingestion.py
+
+import asyncio
+import httpx
+import logging
+from typing import Dict
+
+# --- Configuration ---
+logging.basicConfig(
+    level="INFO",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("ApiJobSubmitter")
+
+# The API URL must point to your public Nginx server and the correct location block.
+API_BASE_URL = "http://localhost:6000"
+
+# --- Test Data Payloads ---
+text_episode = {
+    "content": "The Statue of Liberty was a gift to the United States from the people of France in 1886. It was designed by French sculptor Frédéric Auguste Bartholdi.",
+    "type": "text",
+    "description": "API Test: Historical fact about the Statue of Liberty.",
+}
+
+json_episode = {
+    "content": {
+        "event": "Completion of the Statue of Liberty",
+        "location": "New York Harbor, USA",
+        "origin_country": "France",
+        "year": 1886,
+        "key_figures": ["Frédéric Auguste Bartholdi", "Gustave Eiffel"],
+    },
+    "type": "json",
+    "description": "API Test: Structured data about the Statue of Liberty.",
+}
+
+
+async def submit_ingestion_job(
+    client: httpx.AsyncClient, episode_data: Dict, test_name: str
+):
+    """
+    Handles submitting a single ingestion job to the API endpoint.
+    This function does NOT wait for the job to complete.
+    """
+    logger.info(f"--- [SUBMITTING] Job: '{test_name}' ---")
+
+    try:
+        # Submit the job to the ingestion service
+        submit_response = await client.post(
+            f"{API_BASE_URL}/episodes/", json=episode_data, timeout=10.0
+        )
+
+        # Check if the submission was accepted by the server
+        if submit_response.status_code == 202:
+            response_data = submit_response.json()
+            job_id = response_data.get("job_id")
+            logger.info(f"✅ [{test_name}] SUBMITTED SUCCESSFULLY. Job ID: {job_id}")
+            logger.info(f"   ---> Monitor the dashboard for its progress from 'pending' to 'completed'.")
+        else:
+            logger.error(
+                f"❌ [{test_name}] FAILED to submit job. "
+                f"Status: {submit_response.status_code}, Body: {submit_response.text}"
+            )
+
+    except httpx.RequestError as e:
+        logger.error(f"❌ [{test_name}] FAILED during submission. Connection error: {e}")
+
+
+async def main():
+    """
+    Main function to orchestrate and run all API job submissions concurrently.
+    """
+    print("\n" + "="*80)
+    print("🚀 STARTING INGESTION JOB SUBMITTER 🚀")
+    print("="*80)
+    print("Instructions:")
+    print("1. This script will fire multiple jobs at the API endpoint.")
+    print("2. It does NOT wait for them to complete.")
+    print(f"3. Your job is to watch the dashboard at https://114.130.116.79/ingestion/dashboard/ in real-time!")
+    print("   You should see jobs instantly appear in the 'Pending' column.")
+    print("-" * 80)
+
+    # The verify=False is needed for self-signed SSL certificates.
+    async with httpx.AsyncClient(verify=False) as client:
+        # Create a list of submission tasks to run concurrently
+        tasks = [
+            submit_ingestion_job(client, text_episode, "Text Episode Ingestion"),
+            submit_ingestion_job(client, json_episode, "JSON Episode Ingestion"),
+            # You can add more jobs here to test higher loads
+            # submit_ingestion_job(client, text_episode, "Text Episode Ingestion #2"),
+        ]
+        await asyncio.gather(*tasks)
+
+    print("\n" + "="*80)
+    print("✅ SUBMISSION COMPLETE ✅")
+    print("="*80)
+    print("All jobs have been sent to the server. Please check your dashboard to monitor their progress.")
+    print("")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nJob submission interrupted by user.")
+
+================================================================================
+--- File: tests/test_ingestion_service.py ---
+================================================================================
+
+import asyncio
+import logging
+
+# Ensure all services (Neo4j, vLLM, Triton) are running before executing this script.
+# This script must be run from the root of your project where the .env file is located.
+
+# --- Step 1: Import necessary components ---
+from graphiti_ingestion.services.graphiti_service import (
+    initialize_graphiti_service,
+    get_graphiti_service,
+)
+from graphiti_ingestion.config import get_settings
+
+
+async def main():
+    """
+    A standalone script to test the core functionality of the GraphitiService.
+    """
+    # --- Step 2: Configure logging and load settings ---
+    settings = get_settings()
+    logging.basicConfig(
+        level=settings.LOG_LEVEL.upper(),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    logger = logging.getLogger("IntegrationTest")
+    
+    graphiti_service = None
+    try:
+        # --- Step 3: Initialize the service (mimics application startup) ---
+        logger.info("Initializing Graphiti Service for the test...")
+        # This function creates the singleton instance and stores it
+        initialize_graphiti_service()
+        # We retrieve the instance to use it
+        graphiti_service = get_graphiti_service()
+        
+        # This builds the necessary indices and constraints in Neo4j
+        await graphiti_service.startup()
+        logger.info("Service startup complete. Indices should be ready.")
+
+        # --- Step 4: Define dummy episode data ---
+        text_episode = {
+            "content": "The Eiffel Tower, located in Paris, was completed in 1889.",
+            "type": "text",
+            "description": "Historical fact from a test script.",
+        }
+
+        json_episode = {
+            "content": {
+                "landmark": "Eiffel Tower",
+                "city": "Paris",
+                "country": "France",
+                "year_completed": 1889,
+            },
+            "type": "json",
+            "description": "Structured data from a test script.",
+        }
+
+        # --- Step 5: Run the ingestion logic ---
+        logger.info("--- Testing TEXT episode ingestion ---")
+        await graphiti_service.process_and_add_episode(text_episode)
+        logger.info("✅ Text episode ingestion test PASSED.")
+        
+        # Add a small delay if needed, though usually not necessary
+        await asyncio.sleep(1)
+
+        logger.info("--- Testing JSON episode ingestion ---")
+        await graphiti_service.process_and_add_episode(json_episode)
+        logger.info("✅ JSON episode ingestion test PASSED.")
+        
+        logger.info("\nIntegration test completed successfully!")
+        logger.info("Check your Neo4j database to verify that the nodes and relationships for the 'Eiffel Tower' have been created.")
+
+    except Exception as e:
+        logger.critical(f"An error occurred during the integration test: {e}", exc_info=True)
+    finally:
+        # --- Step 6: Cleanly shut down the service ---
+        if graphiti_service:
+            logger.info("Shutting down the Graphiti Service...")
+            await graphiti_service.shutdown()
+            logger.info("Service shutdown complete.")
+
+
+if __name__ == "__main__":
+    # Ensure you have a .env file in the same directory where you run this script
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nTest interrupted by user.")
+
+================================================================================
+--- File: graphiti_ingestion_service.egg-info/top_level.txt ---
+================================================================================
+
+graphiti_ingestion
+
+
+================================================================================
+--- File: graphiti_ingestion_service.egg-info/PKG-INFO ---
+================================================================================
+
+Metadata-Version: 2.4
+Name: graphiti-ingestion-service
+Version: 0.1.0
+
+
+================================================================================
+--- File: graphiti_ingestion_service.egg-info/dependency_links.txt ---
+================================================================================
+
+
+
+
+================================================================================
+--- File: graphiti_ingestion_service.egg-info/SOURCES.txt ---
+================================================================================
+
+README.md
+setup.py
+graphiti_ingestion/__init__.py
+graphiti_ingestion_service.egg-info/PKG-INFO
+graphiti_ingestion_service.egg-info/SOURCES.txt
+graphiti_ingestion_service.egg-info/dependency_links.txt
+graphiti_ingestion_service.egg-info/top_level.txt
+

@@ -24,6 +24,9 @@ EXCLUDED_DIRECTORIES = [
     'dist',
     'build',
     '*.egg-info'
+    'README.md',
+    'requirements.txt',
+    'setup.py'
 ]
 
 # Ignored file names or patterns
@@ -34,6 +37,7 @@ EXCLUDED_FILES = [
     '*.swp',
     '.DS_Store',
     'configs/apis.csv',
+    '*.egg-info',
     OUTPUT_FILENAME # Exclude the output file itself
 ]
 # --- END OF CONFIGURATION ---
